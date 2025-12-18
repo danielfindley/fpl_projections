@@ -34,10 +34,11 @@ class BonusModel:
         'gca_per90_roll3',
         'key_passes_per90_roll1',
         'key_passes_per90_roll3',
-        'pred_goal_prob',
-        'pred_assist_prob', 
-        'pred_defcon_prob',
-        'pred_minutes',
+        # 'pred_goal_prob',
+        # 'pred_assist_prob', 
+        # 'pred_defcon_prob',
+        # 'pred_minutes',
+        
         
         # Rolling performance - scoring
         'player_roll5_xg',
@@ -58,8 +59,21 @@ class BonusModel:
         'bonus_rate_roll10',
         
         # Defcon history
-        'defcon_roll5',
         'defcon_per90_roll5',
+        'defcon_per90_roll10',
+        'defcon_per90_last1',
+        
+        # Component stats per-90
+        'tackles_per90_roll5',
+        'interceptions_per90_roll5',
+        'clearances_per90_roll5',
+        'blocks_per90_roll5',
+        'recoveries_per90_roll5',
+        
+        # Recent form
+        'defcon_last1',
+        'defcon_roll3',
+        'defcon_roll5',
         
         # Position indicators
         'is_forward',

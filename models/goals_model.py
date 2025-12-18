@@ -32,7 +32,12 @@ class GoalsModel:
         'key_passes_per90_roll3',
         'goals_per90_roll5',
         'goals_per90_roll10',
+        'shots_per90_roll10',
+        'sca_per90_roll10',
+        'gca_per90_roll10',
+        'key_passes_per90_roll10',
         'xg_per90_roll5',
+        'xg_per90_roll10',
         'shots_per90_roll5',
         'sca_per90_roll5',
         'gca_per90_roll5',
@@ -43,13 +48,37 @@ class GoalsModel:
         'xg_roll3',
         
         # Team context (attacking strength)
+        'team_xg_roll1',
+        'team_goals_roll1',
+        'team_shots_roll1',
+        'team_xg_roll3',
+        'team_goals_roll3',
+        'team_shots_roll3',
         'team_xg_roll5',
         'team_goals_roll5',
         'team_shots_roll5',
+        'team_xg_roll10',
+        'team_goals_roll10',
+        'team_shots_roll10',
+        'team_xg_roll20',
+        'team_goals_roll20',
+        'team_shots_roll20',
         
         # Opponent context (defensive weakness)
         'opp_conceded_roll5',
         'opp_xg_against_roll5',
+        'opp_conceded_roll1',
+        'opp_xg_against_roll1',
+        'opp_shots_roll1',
+        'opp_conceded_roll3',
+        'opp_xg_against_roll3',
+        'opp_shots_roll3',
+        'opp_conceded_roll10',
+        'opp_xg_against_roll10',
+        'opp_shots_roll10',
+        'opp_conceded_roll20',
+        'opp_xg_against_roll20',
+        'opp_shots_roll20',
         
         # Match context
         'is_home',
@@ -153,6 +182,7 @@ class GoalsModel:
             df = self.prepare_features(df)
         
         df = df.copy()
+        print(df['team_xg_roll10'])
         
         # Filter to players who actually played (1+ minutes)
         played_mask = df['minutes'] >= 1

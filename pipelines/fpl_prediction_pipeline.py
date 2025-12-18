@@ -3,6 +3,10 @@ FPL Points Prediction Pipeline
 
 Complete pipeline for predicting FPL points for a target gameweek.
 Loads raw data, computes features, trains models, and generates predictions.
+
+Supports two modes:
+- Prediction mode: Generate predictions for upcoming gameweeks
+- Tune mode: Evaluate models using train/test split or cross-validation
 """
 
 import pandas as pd
@@ -12,9 +16,21 @@ import requests
 import time
 import warnings
 from pathlib import Path
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, List, Optional, Callable
+from dataclasses import dataclass, field
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.feature_selection import RFE, SelectFromModel
 
 warnings.filterwarnings('ignore')
+
+# Optional Optuna import
+try:
+    import optuna
+    from optuna.samplers import TPESampler
+    OPTUNA_AVAILABLE = True
+except ImportError:
+    OPTUNA_AVAILABLE = False
 
 # Import models
 import sys
@@ -26,6 +42,174 @@ from models.assists_model import AssistsModel
 from models.defcon_model import DefconModel
 from models.clean_sheet_model import CleanSheetModel
 from models.bonus_model import BonusModel
+
+
+# ============================================================================
+# TUNE MODE CONFIGURATION AND METRICS
+# ============================================================================
+
+@dataclass
+class TuneConfig:
+    """Configuration for model tuning and evaluation.
+    
+    Attributes:
+        models: List of model names to tune. Options: 'minutes', 'goals', 'assists', 'defcon', 'clean_sheet', 'bonus'
+        test_size: Fraction of data to use for testing (default 0.2)
+        cv_folds: Number of cross-validation folds (if None, uses train/test split)
+        random_state: Random seed for reproducibility
+        hyperparams: Dict of model_name -> dict of hyperparameters to override
+        feature_selection: Feature selection method ('none', 'importance', 'rfe')
+        feature_selection_k: Number of top features to keep (for 'importance' and 'rfe')
+        optuna_trials: Number of Optuna trials for hyperparameter optimization (0 to disable)
+        optuna_timeout: Timeout in seconds for Optuna optimization (None for no timeout)
+    """
+    models: List[str] = field(default_factory=lambda: ['goals', 'assists', 'minutes', 'defcon'])
+    test_size: float = 0.2
+    cv_folds: Optional[int] = None  # If set, uses cross-validation instead of train/test split
+    random_state: int = 42
+    hyperparams: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    
+    # Feature selection options
+    feature_selection: str = 'none'  # 'none', 'importance', 'rfe'
+    feature_selection_k: int = 20  # Number of features to keep
+    
+    # Optuna hyperparameter optimization
+    optuna_trials: int = 0  # Number of trials (0 = disabled)
+    optuna_timeout: Optional[int] = None  # Timeout in seconds
+    
+    # Default hyperparameters for each model type
+    @staticmethod
+    def default_hyperparams() -> Dict[str, Dict[str, Any]]:
+        return {
+            'goals': {
+                'n_estimators': 200,
+                'max_depth': 5,
+                'learning_rate': 0.08,
+                'min_child_weight': 3,
+            },
+            'assists': {
+                'n_estimators': 200,
+                'max_depth': 5,
+                'learning_rate': 0.08,
+                'min_child_weight': 3,
+            },
+            'minutes': {
+                'n_estimators': 200,
+                'max_depth': 4,
+                'learning_rate': 0.1,
+                'min_child_weight': 5,
+            },
+            'defcon': {
+                'n_estimators': 200,
+                'max_depth': 5,
+                'learning_rate': 0.08,
+                'min_child_weight': 3,
+            },
+            'bonus': {
+                'n_estimators': 150,
+                'max_depth': 5,
+                'learning_rate': 0.1,
+                'min_child_weight': 3,
+            },
+        }
+    
+    # Optuna search spaces for each model
+    @staticmethod
+    def optuna_search_space() -> Dict[str, Dict[str, Any]]:
+        """Define the search space for Optuna optimization."""
+        return {
+            'goals': {
+                'n_estimators': ('int', 100, 500),
+                'max_depth': ('int', 3, 10),
+                'learning_rate': ('float_log', 0.01, 0.3),
+                'min_child_weight': ('int', 1, 10),
+                'subsample': ('float', 0.6, 1.0),
+                'colsample_bytree': ('float', 0.6, 1.0),
+                'reg_alpha': ('float_log', 1e-8, 10.0),
+                'reg_lambda': ('float_log', 1e-8, 10.0),
+            },
+            'assists': {
+                'n_estimators': ('int', 100, 500),
+                'max_depth': ('int', 3, 10),
+                'learning_rate': ('float_log', 0.01, 0.3),
+                'min_child_weight': ('int', 1, 10),
+                'subsample': ('float', 0.6, 1.0),
+                'colsample_bytree': ('float', 0.6, 1.0),
+            },
+            'minutes': {
+                'n_estimators': ('int', 100, 500),
+                'max_depth': ('int', 3, 8),
+                'learning_rate': ('float_log', 0.01, 0.3),
+                'min_child_weight': ('int', 1, 15),
+                'subsample': ('float', 0.6, 1.0),
+            },
+            'defcon': {
+                'n_estimators': ('int', 100, 500),
+                'max_depth': ('int', 3, 10),
+                'learning_rate': ('float_log', 0.01, 0.3),
+                'min_child_weight': ('int', 1, 10),
+            },
+            'bonus': {
+                'n_estimators': ('int', 50, 300),
+                'max_depth': ('int', 3, 8),
+                'learning_rate': ('float_log', 0.01, 0.3),
+                'min_child_weight': ('int', 1, 10),
+            },
+        }
+    
+    def get_hyperparams(self, model_name: str) -> Dict[str, Any]:
+        """Get hyperparameters for a model, merging defaults with overrides."""
+        defaults = self.default_hyperparams()
+        params = defaults.get(model_name, {}).copy()
+        params.update(self.hyperparams.get(model_name, {}))
+        params['random_state'] = self.random_state
+        return params
+
+
+@dataclass
+class ModelMetrics:
+    """Container for model evaluation metrics."""
+    model_name: str
+    mae: float
+    rmse: float
+    r2: float
+    samples: int
+    cv_scores: Optional[List[float]] = None  # If using cross-validation
+    feature_importance: Optional[pd.DataFrame] = None
+    selected_features: Optional[List[str]] = None  # Features after selection
+    best_params: Optional[Dict[str, Any]] = None  # Best params from Optuna
+    optuna_study: Optional[Any] = None  # Optuna study object
+    
+    def __str__(self) -> str:
+        result = f"\n{'='*60}\n"
+        result += f"  {self.model_name.upper()} MODEL METRICS\n"
+        result += f"{'='*60}\n"
+        result += f"  Samples: {self.samples:,}\n"
+        result += f"  MAE:     {self.mae:.4f}\n"
+        result += f"  RMSE:    {self.rmse:.4f}\n"
+        result += f"  R²:      {self.r2:.4f}\n"
+        if self.cv_scores:
+            result += f"  CV Scores (MAE): {[f'{s:.4f}' for s in self.cv_scores]}\n"
+            result += f"  CV Mean ± Std:   {np.mean(self.cv_scores):.4f} ± {np.std(self.cv_scores):.4f}\n"
+        if self.selected_features:
+            result += f"  Selected Features: {len(self.selected_features)}\n"
+        if self.best_params:
+            result += f"  Best Params (Optuna):\n"
+            for k, v in self.best_params.items():
+                result += f"    {k}: {v}\n"
+        return result
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'model_name': self.model_name,
+            'mae': self.mae,
+            'rmse': self.rmse,
+            'r2': self.r2,
+            'samples': self.samples,
+            'cv_scores': self.cv_scores,
+            'selected_features': self.selected_features,
+            'best_params': self.best_params,
+        }
 
 
 # FPL Scoring Rules
@@ -373,7 +557,7 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
         team_stats[f'{col}_roll10'] = team_stats.groupby('team')[col].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
         team_stats[f'{col}_roll20'] = team_stats.groupby('team')[col].transform(lambda x: x.shift(1).rolling(20, min_periods=1).mean())
     
-    df = df.merge(team_stats[['team', 'season', 'gameweek', 'team_goals_roll5', 'team_xg_roll5', 'team_shots_roll5']],
+    df = df.merge(team_stats[['team', 'season', 'gameweek', 'team_goals_roll5', 'team_xg_roll5', 'team_shots_roll5','team_goals_roll10', 'team_xg_roll10', 'team_shots_roll10','team_goals_roll20', 'team_xg_roll20', 'team_shots_roll20']],
                   on=['team', 'season', 'gameweek'], how='left')
     
     # Opponent rolling features
@@ -395,13 +579,15 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     opp_stats['opp_conceded_roll10'] = opp_stats.groupby('opponent')['opp_goals'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
     opp_stats['opp_xg_against_roll10'] = opp_stats.groupby('opponent')['opp_xg'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
     opp_stats['opp_shots_roll10'] = opp_stats.groupby('opponent')['opp_shots'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
+    opp_stats['opp_xg_roll10'] = opp_stats.groupby('opponent')['opp_xg'].transform(lambda x: x.shift(1).rolling(10, min_periods=1).mean())
     opp_stats['opp_conceded_roll20'] = opp_stats.groupby('opponent')['opp_goals'].transform(lambda x: x.shift(1).rolling(20, min_periods=1).mean())
     opp_stats['opp_xg_against_roll20'] = opp_stats.groupby('opponent')['opp_xg'].transform(lambda x: x.shift(1).rolling(20, min_periods=1).mean())
     opp_stats['opp_shots_roll20'] = opp_stats.groupby('opponent')['opp_shots'].transform(lambda x: x.shift(1).rolling(20, min_periods=1).mean())
+    opp_stats['opp_xg_roll20'] = opp_stats.groupby('opponent')['opp_xg'].transform(lambda x: x.shift(1).rolling(20, min_periods=1).mean())
 
 
     
-    df = df.merge(opp_stats[['opponent', 'season', 'gameweek', 'opp_conceded_roll5', 'opp_xg_against_roll5', 'opp_xg_roll5', 'opp_shots_roll5']],
+    df = df.merge(opp_stats[['opponent', 'season', 'gameweek', 'opp_conceded_roll5', 'opp_xg_against_roll5', 'opp_xg_roll5', 'opp_shots_roll5','opp_conceded_roll10', 'opp_xg_against_roll10', 'opp_xg_roll10', 'opp_shots_roll10','opp_conceded_roll20', 'opp_xg_against_roll20', 'opp_xg_roll20', 'opp_shots_roll20']],
                   on=['opponent', 'season', 'gameweek'], how='left')
     
     df['is_home'] = df['is_home'].astype(int)
@@ -501,7 +687,12 @@ def calculate_expected_points(row: pd.Series) -> pd.Series:
 
 
 class FPLPredictionPipeline:
-    """Complete FPL prediction pipeline."""
+    """Complete FPL prediction pipeline.
+    
+    Supports two modes:
+    - run(): Generate predictions for a target gameweek
+    - tune(): Evaluate models using train/test split or cross-validation
+    """
     
     def __init__(self, data_dir: str = '../data'):
         self.data_dir = Path(data_dir)
@@ -509,6 +700,635 @@ class FPLPredictionPipeline:
         self.df = None
         self.train_df = None
         self.test_df = None
+        self.tune_results: Dict[str, ModelMetrics] = {}
+    
+    def tune(self, config: TuneConfig = None, verbose: bool = True) -> Dict[str, ModelMetrics]:
+        """
+        Run model tuning and evaluation using train/test split or cross-validation.
+        
+        Args:
+            config: TuneConfig object with tuning settings. If None, uses defaults.
+            verbose: Print progress and results
+            
+        Returns:
+            Dictionary of model_name -> ModelMetrics
+        """
+        if config is None:
+            config = TuneConfig()
+        
+        if verbose:
+            print('=' * 70)
+            print('FPL MODEL TUNING MODE')
+            print('=' * 70)
+            print(f"  Models to tune: {config.models}")
+            print(f"  Test size: {config.test_size}" if not config.cv_folds else f"  CV folds: {config.cv_folds}")
+            print(f"  Random state: {config.random_state}")
+            print('=' * 70)
+        
+        # Step 1: Load data
+        self.df = load_raw_data(self.data_dir, verbose)
+        
+        # Step 2: Compute features
+        self.df = compute_rolling_features(self.df, verbose)
+        
+        # Filter to players who played
+        played_df = self.df[self.df['minutes'] >= 1].copy()
+        
+        if verbose:
+            print(f'\n[3] Splitting data for evaluation...')
+            print(f'    Total samples (played 1+ min): {len(played_df):,}')
+        
+        # Run tuning for each model
+        results = {}
+        
+        for model_name in config.models:
+            if verbose:
+                print(f'\n{"="*70}')
+                print(f'TUNING: {model_name.upper()} MODEL')
+                print(f'{"="*70}')
+            
+            if model_name == 'goals':
+                metrics = self._tune_goals_model(played_df, config, verbose)
+            elif model_name == 'assists':
+                metrics = self._tune_assists_model(played_df, config, verbose)
+            elif model_name == 'minutes':
+                metrics = self._tune_minutes_model(played_df, config, verbose)
+            elif model_name == 'defcon':
+                metrics = self._tune_defcon_model(played_df, config, verbose)
+            elif model_name == 'clean_sheet':
+                metrics = self._tune_clean_sheet_model(config, verbose)
+            elif model_name == 'bonus':
+                metrics = self._tune_bonus_model(played_df, config, verbose)
+            else:
+                print(f'  WARNING: Unknown model "{model_name}", skipping...')
+                continue
+            
+            results[model_name] = metrics
+            if verbose:
+                print(metrics)
+        
+        self.tune_results = results
+        
+        if verbose:
+            print('\n' + '=' * 70)
+            print('TUNING COMPLETE - SUMMARY')
+            print('=' * 70)
+            for name, metrics in results.items():
+                print(f"  {name.upper():12} | MAE: {metrics.mae:.4f} | RMSE: {metrics.rmse:.4f} | R²: {metrics.r2:.4f}")
+            print('=' * 70)
+        
+        return results
+    
+    def _tune_goals_model(self, df: pd.DataFrame, config: TuneConfig, verbose: bool) -> ModelMetrics:
+        """Tune and evaluate the goals model."""
+        params = config.get_hyperparams('goals')
+        
+        # Optuna optimization if enabled
+        study = None
+        if config.optuna_trials > 0:
+            params, study = self._optuna_optimize('goals', GoalsModel, df, config, verbose)
+        
+        if config.cv_folds:
+            return self._cv_evaluate_model('goals', GoalsModel, df, config, params, study, verbose)
+        else:
+            return self._split_evaluate_model('goals', GoalsModel, df, config, params, study, verbose)
+    
+    def _tune_assists_model(self, df: pd.DataFrame, config: TuneConfig, verbose: bool) -> ModelMetrics:
+        """Tune and evaluate the assists model."""
+        params = config.get_hyperparams('assists')
+        
+        # Optuna optimization if enabled
+        study = None
+        if config.optuna_trials > 0:
+            params, study = self._optuna_optimize('assists', AssistsModel, df, config, verbose)
+        
+        if config.cv_folds:
+            return self._cv_evaluate_model('assists', AssistsModel, df, config, params, study, verbose)
+        else:
+            return self._split_evaluate_model('assists', AssistsModel, df, config, params, study, verbose)
+    
+    def _tune_minutes_model(self, df: pd.DataFrame, config: TuneConfig, verbose: bool) -> ModelMetrics:
+        """Tune and evaluate the minutes model."""
+        params = config.get_hyperparams('minutes')
+        
+        # Optuna optimization if enabled
+        study = None
+        if config.optuna_trials > 0:
+            params, study = self._optuna_optimize('minutes', MinutesModel, df, config, verbose)
+        
+        if config.cv_folds:
+            return self._cv_evaluate_model('minutes', MinutesModel, df, config, params, study, verbose)
+        else:
+            return self._split_evaluate_model('minutes', MinutesModel, df, config, params, study, verbose)
+    
+    def _tune_defcon_model(self, df: pd.DataFrame, config: TuneConfig, verbose: bool) -> ModelMetrics:
+        """Tune and evaluate the defcon model."""
+        params = config.get_hyperparams('defcon')
+        
+        # Optuna optimization if enabled
+        study = None
+        if config.optuna_trials > 0:
+            params, study = self._optuna_optimize('defcon', DefconModel, df, config, verbose)
+        
+        if config.cv_folds:
+            return self._cv_evaluate_model('defcon', DefconModel, df, config, params, study, verbose)
+        else:
+            return self._split_evaluate_model('defcon', DefconModel, df, config, params, study, verbose)
+    
+    def _tune_clean_sheet_model(self, config: TuneConfig, verbose: bool) -> ModelMetrics:
+        """Tune and evaluate the clean sheet model."""
+        # CS model uses team-level features, different from player models
+        cs_model = CleanSheetModel()
+        team_features = cs_model.prepare_features(self.df)
+        
+        # Train/test split on team-match data
+        train_teams, test_teams = train_test_split(
+            team_features, test_size=config.test_size, random_state=config.random_state
+        )
+        
+        cs_model.fit(train_teams, verbose=False)
+        
+        # Evaluate
+        y_test = test_teams['clean_sheet'].values
+        y_pred = cs_model.predict_proba(test_teams)
+        
+        # For classification, use different metrics
+        from sklearn.metrics import roc_auc_score, brier_score_loss
+        auc = roc_auc_score(y_test, y_pred)
+        brier = brier_score_loss(y_test, y_pred)
+        
+        if verbose:
+            print(f"  Train samples: {len(train_teams):,}")
+            print(f"  Test samples: {len(test_teams):,}")
+            print(f"  AUC-ROC: {auc:.4f}")
+            print(f"  Brier Score: {brier:.4f}")
+        
+        self.models['clean_sheet'] = cs_model
+        
+        return ModelMetrics(
+            model_name='clean_sheet',
+            mae=brier,  # Use Brier score as MAE analog for probability
+            rmse=np.sqrt(brier),
+            r2=auc,  # Use AUC as R² analog
+            samples=len(test_teams),
+            feature_importance=cs_model.feature_importance() if hasattr(cs_model, 'feature_importance') else None
+        )
+    
+    def _split_evaluate_model(self, name: str, model_class, df: pd.DataFrame, 
+                               config: TuneConfig, params: Dict, study, verbose: bool) -> ModelMetrics:
+        """Evaluate a model using train/test split."""
+        # Random split
+        train_df, test_df = train_test_split(
+            df, test_size=config.test_size, random_state=config.random_state
+        )
+        
+        if verbose:
+            print(f"  Train samples: {len(train_df):,}")
+            print(f"  Test samples: {len(test_df):,}")
+        
+        # Feature selection if enabled
+        selected_features = None
+        if config.feature_selection != 'none':
+            # Get model features
+            temp_model = model_class(**params)
+            original_features = temp_model.FEATURES.copy()
+            
+            if config.feature_selection == 'importance':
+                selected_features = self._select_features_importance(
+                    model_class, train_df, original_features,
+                    temp_model.TARGET, config.feature_selection_k, params, verbose
+                )
+            elif config.feature_selection == 'rfe':
+                target_col = temp_model.TARGET
+                selected_features = self._select_features_rfe(
+                    train_df, original_features, target_col, 
+                    config.feature_selection_k, verbose
+                )
+            
+            # Update model class to use selected features
+            # Note: This creates a custom model with reduced features
+            if selected_features:
+                model_class.FEATURES = selected_features
+        
+        # Create and train model
+        model = model_class(**params)
+        model.fit(train_df, verbose=False)
+        
+        # Get predictions and actuals based on model type
+        if name == 'minutes':
+            y_test = test_df['minutes'].values
+            y_pred = model.predict(test_df)
+            target_name = 'minutes'
+        elif name == 'goals':
+            y_test = test_df['goals_per90'].values if 'goals_per90' in test_df.columns else (test_df['goals'] / np.maximum(test_df['minutes'] / 90, 0.01)).values
+            y_pred = model.predict_per90(test_df)
+            target_name = 'goals_per90'
+        elif name == 'assists':
+            y_test = test_df['assists_per90'].values if 'assists_per90' in test_df.columns else (test_df['assists'] / np.maximum(test_df['minutes'] / 90, 0.01)).values
+            y_pred = model.predict_per90(test_df)
+            target_name = 'assists_per90'
+        elif name == 'defcon':
+            y_test = test_df['defcon_per90'].values if 'defcon_per90' in test_df.columns else (test_df['defcon'] / np.maximum(test_df['minutes'] / 90, 0.01)).values
+            y_pred = model.predict_per90(test_df)
+            target_name = 'defcon_per90'
+        
+        # Calculate metrics
+        mae = mean_absolute_error(y_test, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        r2 = r2_score(y_test, y_pred)
+        
+        if verbose:
+            print(f"  Target: {target_name}")
+            print(f"  Actual mean: {np.mean(y_test):.4f}")
+            print(f"  Predicted mean: {np.mean(y_pred):.4f}")
+        
+        # Store model
+        self.models[name] = model
+        
+        return ModelMetrics(
+            model_name=name,
+            mae=mae,
+            rmse=rmse,
+            r2=r2,
+            samples=len(test_df),
+            feature_importance=model.feature_importance() if hasattr(model, 'feature_importance') else None,
+            selected_features=selected_features,
+            best_params=params if config.optuna_trials > 0 else None,
+            optuna_study=study
+        )
+    
+    def _cv_evaluate_model(self, name: str, model_class, df: pd.DataFrame,
+                           config: TuneConfig, params: Dict, study, verbose: bool) -> ModelMetrics:
+        """Evaluate a model using k-fold cross-validation."""
+        kf = KFold(n_splits=config.cv_folds, shuffle=True, random_state=config.random_state)
+        
+        cv_maes = []
+        cv_rmses = []
+        cv_r2s = []
+        
+        # Feature selection if enabled (do once before CV)
+        selected_features = None
+        if config.feature_selection != 'none':
+            temp_model = model_class(**params)
+            original_features = temp_model.FEATURES.copy()
+            
+            if config.feature_selection == 'importance':
+                selected_features = self._select_features_importance(
+                    model_class, df, original_features,
+                    temp_model.TARGET, config.feature_selection_k, params, verbose
+                )
+            elif config.feature_selection == 'rfe':
+                target_col = temp_model.TARGET
+                selected_features = self._select_features_rfe(
+                    df, original_features, target_col, 
+                    config.feature_selection_k, verbose
+                )
+            
+            if selected_features:
+                model_class.FEATURES = selected_features
+        
+        if verbose:
+            print(f"  Running {config.cv_folds}-fold cross-validation...")
+        
+        for fold, (train_idx, test_idx) in enumerate(kf.split(df)):
+            train_df = df.iloc[train_idx]
+            test_df = df.iloc[test_idx]
+            
+            model = model_class(**params)
+            model.fit(train_df, verbose=False)
+            
+            # Get predictions based on model type
+            if name == 'minutes':
+                y_test = test_df['minutes'].values
+                y_pred = model.predict(test_df)
+            elif name == 'goals':
+                y_test = test_df['goals_per90'].values if 'goals_per90' in test_df.columns else (test_df['goals'] / np.maximum(test_df['minutes'] / 90, 0.01)).values
+                y_pred = model.predict_per90(test_df)
+            elif name == 'assists':
+                y_test = test_df['assists_per90'].values if 'assists_per90' in test_df.columns else (test_df['assists'] / np.maximum(test_df['minutes'] / 90, 0.01)).values
+                y_pred = model.predict_per90(test_df)
+            elif name == 'defcon':
+                y_test = test_df['defcon_per90'].values if 'defcon_per90' in test_df.columns else (test_df['defcon'] / np.maximum(test_df['minutes'] / 90, 0.01)).values
+                y_pred = model.predict_per90(test_df)
+            
+            mae = mean_absolute_error(y_test, y_pred)
+            rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+            r2 = r2_score(y_test, y_pred)
+            
+            cv_maes.append(mae)
+            cv_rmses.append(rmse)
+            cv_r2s.append(r2)
+            
+            if verbose:
+                print(f"    Fold {fold+1}: MAE={mae:.4f}, RMSE={rmse:.4f}, R²={r2:.4f}")
+        
+        # Train final model on all data for feature importance
+        final_model = model_class(**params)
+        final_model.fit(df, verbose=False)
+        self.models[name] = final_model
+        
+        return ModelMetrics(
+            model_name=name,
+            mae=np.mean(cv_maes),
+            rmse=np.mean(cv_rmses),
+            r2=np.mean(cv_r2s),
+            samples=len(df),
+            cv_scores=cv_maes,
+            feature_importance=final_model.feature_importance() if hasattr(final_model, 'feature_importance') else None,
+            selected_features=selected_features,
+            best_params=params if config.optuna_trials > 0 else None,
+            optuna_study=study
+        )
+    
+    def get_model(self, name: str):
+        """Get a trained model by name."""
+        if name not in self.models:
+            raise ValueError(f"Model '{name}' not found. Available: {list(self.models.keys())}")
+        return self.models[name]
+    
+    def get_tune_results(self) -> Dict[str, ModelMetrics]:
+        """Get results from the last tune() call."""
+        return self.tune_results
+    
+    # =========================================================================
+    # FEATURE SELECTION METHODS
+    # =========================================================================
+    
+    def _select_features_importance(self, model_class, df: pd.DataFrame, 
+                                     features: List[str], target_col: str,
+                                     k: int, params: Dict, verbose: bool) -> List[str]:
+        """Select top k features by importance using a trained model."""
+        if verbose:
+            print(f"  Feature selection: importance-based (top {k} features)")
+        
+        # Train a model to get feature importances
+        temp_model = model_class(**params)
+        temp_model.fit(df, verbose=False)
+        
+        # Get feature importance
+        fi = temp_model.feature_importance()
+        top_features = fi.head(k)['feature'].tolist()
+        
+        if verbose:
+            print(f"    Selected {len(top_features)} features")
+            print(f"    Top 5: {top_features[:5]}")
+        
+        return top_features
+    
+    def _select_features_rfe(self, df: pd.DataFrame, features: List[str], 
+                              target_col: str, k: int, verbose: bool) -> List[str]:
+        """Select features using Recursive Feature Elimination."""
+        import xgboost as xgb
+        
+        if verbose:
+            print(f"  Feature selection: RFE (top {k} features)")
+        
+        X = df[features].fillna(0).astype(float)
+        y = df[target_col].fillna(0)
+        
+        # Use XGBoost as base estimator
+        base_model = xgb.XGBRegressor(n_estimators=50, max_depth=4, random_state=42)
+        
+        # RFE
+        rfe = RFE(base_model, n_features_to_select=k, step=5)
+        rfe.fit(X, y)
+        
+        selected_features = [f for f, selected in zip(features, rfe.support_) if selected]
+        
+        if verbose:
+            print(f"    Selected {len(selected_features)} features")
+            print(f"    Top 5: {selected_features[:5]}")
+        
+        return selected_features
+    
+    # =========================================================================
+    # OPTUNA HYPERPARAMETER OPTIMIZATION
+    # =========================================================================
+    
+    def _optuna_optimize(self, name: str, model_class, df: pd.DataFrame,
+                         config: TuneConfig, verbose: bool) -> Tuple[Dict[str, Any], Any]:
+        """Run Optuna hyperparameter optimization."""
+        if not OPTUNA_AVAILABLE:
+            raise ImportError("Optuna is not installed. Run: pip install optuna")
+        
+        if verbose:
+            print(f"  Running Optuna optimization ({config.optuna_trials} trials)...")
+        
+        search_space = config.optuna_search_space().get(name, {})
+        
+        # Split data for optimization
+        train_df, val_df = train_test_split(
+            df, test_size=config.test_size, random_state=config.random_state
+        )
+        
+        def objective(trial):
+            # Sample hyperparameters
+            params = {'random_state': config.random_state}
+            
+            for param_name, param_config in search_space.items():
+                param_type = param_config[0]
+                if param_type == 'int':
+                    params[param_name] = trial.suggest_int(param_name, param_config[1], param_config[2])
+                elif param_type == 'float':
+                    params[param_name] = trial.suggest_float(param_name, param_config[1], param_config[2])
+                elif param_type == 'float_log':
+                    params[param_name] = trial.suggest_float(param_name, param_config[1], param_config[2], log=True)
+                elif param_type == 'categorical':
+                    params[param_name] = trial.suggest_categorical(param_name, param_config[1])
+            
+            # Train model
+            model = model_class(**params)
+            model.fit(train_df, verbose=False)
+            
+            # Evaluate
+            if name == 'minutes':
+                y_val = val_df['minutes'].values
+                y_pred = model.predict(val_df)
+            elif name == 'bonus':
+                y_val = val_df['bonus'].values
+                y_pred = model.predict(val_df)
+            else:
+                target_col = f'{name}_per90'
+                if target_col not in val_df.columns:
+                    y_val = (val_df[name] / np.maximum(val_df['minutes'] / 90, 0.01)).values
+                else:
+                    y_val = val_df[target_col].values
+                y_pred = model.predict_per90(val_df)
+            
+            return mean_absolute_error(y_val, y_pred)
+        
+        # Create and run study
+        sampler = TPESampler(seed=config.random_state)
+        study = optuna.create_study(direction='minimize', sampler=sampler)
+        
+        # Suppress Optuna logs unless verbose
+        optuna.logging.set_verbosity(optuna.logging.WARNING if not verbose else optuna.logging.INFO)
+        
+        study.optimize(
+            objective, 
+            n_trials=config.optuna_trials, 
+            timeout=config.optuna_timeout,
+            show_progress_bar=verbose
+        )
+        
+        best_params = study.best_params
+        best_params['random_state'] = config.random_state
+        
+        if verbose:
+            print(f"    Best MAE: {study.best_value:.4f}")
+            print(f"    Best params: {best_params}")
+        
+        return best_params, study
+    
+    # =========================================================================
+    # BONUS MODEL TUNING
+    # =========================================================================
+    
+    def _tune_bonus_model(self, df: pd.DataFrame, config: TuneConfig, verbose: bool) -> ModelMetrics:
+        """Tune and evaluate the bonus model."""
+        params = config.get_hyperparams('bonus')
+        
+        # Bonus model needs special handling - requires bonus column
+        # Filter to players with 60+ minutes (bonus eligibility)
+        bonus_df = df[df['minutes'] >= 60].copy()
+        
+        if 'bonus' not in bonus_df.columns:
+            if verbose:
+                print("  WARNING: No bonus data available. Fetching from FPL API...")
+            # Try to fetch bonus data
+            try:
+                unique_players = set(bonus_df['player_name'].unique())
+                fpl_bonus = fetch_fpl_bonus_data(self.data_dir, unique_players, verbose=False)
+                if len(fpl_bonus) > 0:
+                    bonus_df = bonus_df.merge(
+                        fpl_bonus, 
+                        left_on=['player_name', 'gameweek'], 
+                        right_on=['fbref_name', 'gameweek'], 
+                        how='left'
+                    )
+                    bonus_df['bonus'] = bonus_df['bonus'].fillna(0)
+                else:
+                    if verbose:
+                        print("  ERROR: Could not fetch bonus data.")
+                    return ModelMetrics(
+                        model_name='bonus', mae=0, rmse=0, r2=0, samples=0
+                    )
+            except Exception as e:
+                if verbose:
+                    print(f"  ERROR fetching bonus data: {e}")
+                return ModelMetrics(
+                    model_name='bonus', mae=0, rmse=0, r2=0, samples=0
+                )
+        
+        # Filter to rows with valid bonus data
+        bonus_df = bonus_df[bonus_df['bonus'].notna() & (bonus_df['bonus'] >= 0)]
+        
+        if len(bonus_df) < 100:
+            if verbose:
+                print(f"  WARNING: Only {len(bonus_df)} samples with bonus data. Skipping.")
+            return ModelMetrics(
+                model_name='bonus', mae=0, rmse=0, r2=0, samples=len(bonus_df)
+            )
+        
+        # Optuna optimization if enabled
+        if config.optuna_trials > 0:
+            params, study = self._optuna_optimize('bonus', BonusModel, bonus_df, config, verbose)
+        else:
+            study = None
+        
+        if config.cv_folds:
+            return self._cv_evaluate_bonus_model(bonus_df, config, params, study, verbose)
+        else:
+            return self._split_evaluate_bonus_model(bonus_df, config, params, study, verbose)
+    
+    def _split_evaluate_bonus_model(self, df: pd.DataFrame, config: TuneConfig, 
+                                     params: Dict, study, verbose: bool) -> ModelMetrics:
+        """Evaluate bonus model using train/test split."""
+        train_df, test_df = train_test_split(
+            df, test_size=config.test_size, random_state=config.random_state
+        )
+        
+        if verbose:
+            print(f"  Train samples: {len(train_df):,}")
+            print(f"  Test samples: {len(test_df):,}")
+        
+        model = BonusModel(**params)
+        model.fit(train_df, verbose=False)
+        
+        y_test = test_df['bonus'].values
+        y_pred = model.predict(test_df)
+        
+        mae = mean_absolute_error(y_test, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        r2 = r2_score(y_test, y_pred)
+        
+        if verbose:
+            print(f"  Target: bonus (0-3)")
+            print(f"  Actual mean: {np.mean(y_test):.4f}")
+            print(f"  Predicted mean: {np.mean(y_pred):.4f}")
+        
+        self.models['bonus'] = model
+        
+        return ModelMetrics(
+            model_name='bonus',
+            mae=mae,
+            rmse=rmse,
+            r2=r2,
+            samples=len(test_df),
+            feature_importance=model.feature_importance(),
+            best_params=params if config.optuna_trials > 0 else None,
+            optuna_study=study
+        )
+    
+    def _cv_evaluate_bonus_model(self, df: pd.DataFrame, config: TuneConfig,
+                                  params: Dict, study, verbose: bool) -> ModelMetrics:
+        """Evaluate bonus model using cross-validation."""
+        kf = KFold(n_splits=config.cv_folds, shuffle=True, random_state=config.random_state)
+        
+        cv_maes = []
+        cv_rmses = []
+        cv_r2s = []
+        
+        if verbose:
+            print(f"  Running {config.cv_folds}-fold cross-validation...")
+        
+        for fold, (train_idx, test_idx) in enumerate(kf.split(df)):
+            train_df = df.iloc[train_idx]
+            test_df = df.iloc[test_idx]
+            
+            model = BonusModel(**params)
+            model.fit(train_df, verbose=False)
+            
+            y_test = test_df['bonus'].values
+            y_pred = model.predict(test_df)
+            
+            mae = mean_absolute_error(y_test, y_pred)
+            rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+            r2 = r2_score(y_test, y_pred)
+            
+            cv_maes.append(mae)
+            cv_rmses.append(rmse)
+            cv_r2s.append(r2)
+            
+            if verbose:
+                print(f"    Fold {fold+1}: MAE={mae:.4f}, RMSE={rmse:.4f}, R²={r2:.4f}")
+        
+        # Train final model on all data
+        final_model = BonusModel(**params)
+        final_model.fit(df, verbose=False)
+        self.models['bonus'] = final_model
+        
+        return ModelMetrics(
+            model_name='bonus',
+            mae=np.mean(cv_maes),
+            rmse=np.mean(cv_rmses),
+            r2=np.mean(cv_r2s),
+            samples=len(df),
+            cv_scores=cv_maes,
+            feature_importance=final_model.feature_importance(),
+            best_params=params if config.optuna_trials > 0 else None,
+            optuna_study=study
+        )
         
     def run(self, target_gw: int, target_season: str = '2025-26', verbose: bool = True) -> pd.DataFrame:
         """Run the complete prediction pipeline."""
@@ -588,6 +1408,11 @@ class FPLPredictionPipeline:
             print('=' * 80)
             print('PIPELINE COMPLETE!')
             print('=' * 80)
+            for model_name,model in self.models.items():
+                #print(f'{model_name}: {model.score(self.test_df[model.FEATURES], self.test_df[model_name])}')
+                print(model_name,"FEATURE_IMPORTANCE:")
+                print(model.feature_importance())
+                
         
         return self.test_df
     
@@ -945,18 +1770,18 @@ class FPLPredictionPipeline:
             current_season_train = current_season_train.merge(fpl_bonus, left_on=['player_name', 'gameweek'], right_on=['fbref_name', 'gameweek'], how='left')
             current_season_train['bonus'] = current_season_train['bonus'].fillna(0)
             
-            current_season_train['pred_goal_prob'] = current_season_train['xg_per90_roll5'].fillna(0).clip(0, 1)
-            current_season_train['pred_assist_prob'] = current_season_train['xag_per90_roll5'].fillna(0).clip(0, 1)
-            current_season_train['pred_defcon_prob'] = current_season_train['hit_threshold_roll5'].fillna(0)
-            current_season_train['pred_minutes'] = current_season_train['roll5_minutes_avg'].fillna(60)
+            # current_season_train['pred_goal_prob'] = current_season_train['xg_per90_roll5'].fillna(0).clip(0, 1)
+            # current_season_train['pred_assist_prob'] = current_season_train['xag_per90_roll5'].fillna(0).clip(0, 1)
+            # current_season_train['pred_defcon_prob'] = current_season_train['hit_threshold_roll5'].fillna(0)
+            # current_season_train['pred_minutes'] = current_season_train['roll5_minutes_avg'].fillna(60)
             
             train_bonus_df = current_season_train[current_season_train['minutes'] >= 60].copy()
             
             self.models['bonus'] = BonusModel()
             self.models['bonus'].fit(train_bonus_df, verbose=verbose)
             
-            self.test_df['pred_goal_prob'] = self.test_df['pred_exp_goals'].clip(0, 1)
-            self.test_df['pred_assist_prob'] = self.test_df['pred_exp_assists'].clip(0, 1)
+            # self.test_df['pred_goal_prob'] = self.test_df['pred_exp_goals'].clip(0, 1)
+            # self.test_df['pred_assist_prob'] = self.test_df['pred_exp_assists'].clip(0, 1)
             self.test_df['pred_bonus'] = self.models['bonus'].predict(self.test_df)
         else:
             self.test_df['pred_bonus'] = 0
