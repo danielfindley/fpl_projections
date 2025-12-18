@@ -1,0 +1,560 @@
+"""
+Monte Carlo Simulation-Based Bonus Points Model
+
+Instead of predicting bonus directly, this model:
+1. Predicts baseline BPS (raw score from "boring" stats)
+2. Uses existing model predictions (goals, assists, CS probability)
+3. Runs Monte Carlo simulation to determine bonus from BPS rankings
+
+This is more accurate because bonus points are a ranking-based competition.
+"""
+
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, r2_score
+from typing import Dict, List, Tuple
+from pathlib import Path
+
+
+# BPS scoring rules (2025-26 season)
+BPS_RULES = {
+    # Major events (simulated)
+    'goal': {
+        'GK': 12, 'DEF': 12, 'MID': 18, 'FWD': 24
+    },
+    'assist': 9,
+    'clean_sheet': {
+        'GK': 12, 'DEF': 12, 'MID': 0, 'FWD': 0
+    },
+    # Penalties
+    'goal_conceded': {
+        'GK': -4, 'DEF': -4, 'MID': 0, 'FWD': 0
+    },
+    'yellow_card': -3,
+    'red_card': -9,
+    'own_goal': -6,
+    'penalty_miss': -6,
+    'penalty_save': 15,
+}
+
+
+class BaselineBPSModel:
+    """
+    Predicts baseline BPS score from "boring" stats.
+    
+    This excludes goals, assists, and clean sheets - those are simulated separately.
+    Baseline BPS comes from: passes, tackles, recoveries, saves, etc.
+    """
+    
+    FEATURES = [
+        # Passing/possession stats (primary contributors to baseline BPS)
+        'touches_per90_roll5',
+        'passes_per90_roll5', 
+        'passes_completed_per90_roll5',
+        'progressive_passes_per90_roll5',
+        'key_passes_per90_roll5',
+        'key_passes_per90_roll3',
+        'key_passes_per90_roll1',
+        
+        # Defensive stats (contribute to BPS)
+        'tackles_per90_roll5',
+        'tackles_per90_roll3',
+        'interceptions_per90_roll5',
+        'interceptions_per90_roll3',
+        'clearances_per90_roll5',
+        'blocks_per90_roll5',
+        'recoveries_per90_roll5',
+        
+        # SCA/GCA (shot creating actions)
+        'sca_per90_roll5',
+        'sca_per90_roll3',
+        'sca_per90_roll1',
+        'gca_per90_roll5',
+        'gca_per90_roll3',
+        
+        # Shots (contribute to BPS even if not scored)
+        'shots_per90_roll5',
+        'shots_per90_roll3',
+        'shots_on_target_per90_roll5',
+        
+        # Position indicators (different baseline BPS by position)
+        'is_forward',
+        'is_midfielder',
+        'is_defender',
+        'is_goalkeeper',
+        
+        # Match context
+        'is_home',
+        
+        # Team/opponent context
+        'team_xg_roll5',
+        'team_goals_roll5',
+        'opp_xg_against_roll5',
+        'opp_conceded_roll5',
+        
+        # Minutes (baseline BPS scales with time played)
+        'roll5_minutes_avg',
+        'roll3_minutes_avg',
+    ]
+    
+    TARGET = 'baseline_bps'  # We'll compute this from historical data
+    
+    def __init__(self, **xgb_params):
+        default_params = {
+            'n_estimators': 150,
+            'max_depth': 5,
+            'learning_rate': 0.1,
+            'random_state': 42,
+        }
+        default_params.update(xgb_params)
+        self.model = xgb.XGBRegressor(**default_params)
+        self.scaler = StandardScaler()
+        self.is_fitted = False
+        self._features_used = []
+    
+    def _add_position_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add position indicator features."""
+        df = df.copy()
+        pos = df['position'].fillna('').str.upper()
+        
+        df['is_forward'] = pos.str.contains('FW|CF|ST|LW|RW').astype(int)
+        df['is_midfielder'] = pos.str.contains('CM|DM|AM|LM|RM|MF').astype(int)
+        df['is_defender'] = pos.str.contains('CB|LB|RB|WB|DF').astype(int)
+        df['is_goalkeeper'] = pos.str.contains('GK').astype(int)
+        
+        return df
+    
+    def _compute_baseline_bps(self, df: pd.DataFrame) -> pd.Series:
+        """
+        Compute baseline BPS by subtracting major event BPS from total BPS.
+        
+        baseline_bps = bps - (goals * goal_bps) - (assists * 9) - (cs * cs_bps) + penalties
+        """
+        df = df.copy()
+        
+        # Get position for position-dependent BPS
+        fpl_pos = df.get('fpl_position', 'MID')
+        
+        # Calculate BPS from major events
+        goal_bps = df.apply(lambda r: BPS_RULES['goal'].get(r.get('fpl_position', 'MID'), 18), axis=1)
+        cs_bps = df.apply(lambda r: BPS_RULES['clean_sheet'].get(r.get('fpl_position', 'MID'), 0), axis=1)
+        
+        # Handle goals and assists
+        if 'goals' in df.columns:
+            goals = df['goals'].fillna(0)
+        else:
+            goals = pd.Series(0, index=df.index)
+        
+        if 'assists' in df.columns:
+            assists = df['assists'].fillna(0)
+        else:
+            assists = pd.Series(0, index=df.index)
+        
+        # Clean sheet: 1 if opponent_goals == 0 and player played 60+ mins
+        if 'opponent_goals' in df.columns:
+            opponent_goals = df['opponent_goals'].fillna(0)
+        else:
+            opponent_goals = pd.Series(1, index=df.index)  # Default to 1 (no CS)
+        
+        if 'minutes' in df.columns:
+            minutes = df['minutes'].fillna(0)
+        else:
+            minutes = pd.Series(60, index=df.index)
+        
+        clean_sheet = ((opponent_goals == 0) & (minutes >= 60)).astype(int)
+        
+        # Goals conceded penalty
+        concede_penalty = df.apply(
+            lambda r: BPS_RULES['goal_conceded'].get(r.get('fpl_position', 'MID'), 0) * opponent_goals[r.name]
+            if minutes[r.name] >= 60 else 0, 
+            axis=1
+        )
+        
+        # Total BPS from major events
+        major_event_bps = (goals * goal_bps) + (assists * 9) + (clean_sheet * cs_bps) + concede_penalty
+        
+        # Baseline = total - major events
+        if 'bps' in df.columns:
+            total_bps = df['bps'].fillna(0)
+        else:
+            total_bps = pd.Series(0, index=df.index)
+        
+        baseline = total_bps - major_event_bps
+        
+        # Floor at 0 (can't have negative baseline in practice)
+        return np.maximum(baseline, 0)
+    
+    def fit(self, df: pd.DataFrame, verbose: bool = True):
+        """Train the baseline BPS model."""
+        df = df.copy()
+        df = self._add_position_features(df)
+        
+        # Only train on players who played 60+ mins (bonus eligible)
+        played_mask = (df['minutes'] >= 60) if 'minutes' in df.columns else pd.Series(True, index=df.index)
+        df = df[played_mask].copy()
+        
+        # Compute target: baseline BPS
+        if 'bps' in df.columns:
+            # We have actual BPS data - compute baseline by subtracting major events
+            df['baseline_bps'] = self._compute_baseline_bps(df)
+            self._has_bps_data = True
+            if verbose:
+                print("  Using actual BPS data for training")
+        else:
+            # No BPS data - estimate baseline from stats directly
+            # Use a heuristic based on typical BPS contributions
+            df['baseline_bps'] = self._estimate_baseline_bps(df)
+            self._has_bps_data = False
+            if verbose:
+                print("  Estimating baseline BPS from stats (no actual BPS data)")
+        
+        # Get available features
+        available_features = [f for f in self.FEATURES if f in df.columns]
+        
+        for feat in available_features:
+            df[feat] = df[feat].fillna(0)
+        
+        X = df[available_features].fillna(0).astype(float)
+        y = df['baseline_bps'].fillna(0)
+        
+        # Scale features
+        X_scaled = self.scaler.fit_transform(X)
+        
+        # Sample weights by minutes
+        sample_weights = df['minutes'].values.copy()
+        sample_weights = sample_weights / sample_weights.mean()
+        
+        if verbose:
+            print(f"Training BaselineBPSModel on {len(X)} samples...")
+            print(f"  Features used: {len(available_features)}")
+            print(f"  Avg baseline BPS: {y.mean():.1f}")
+        
+        self.model.fit(X_scaled, y, sample_weight=sample_weights)
+        self.is_fitted = True
+        self._features_used = available_features
+        
+        if verbose:
+            y_pred = self.model.predict(X_scaled)
+            print(f"  MAE: {mean_absolute_error(y, y_pred):.2f}")
+            print(f"  R²: {r2_score(y, y_pred):.3f}")
+        
+        return self
+    
+    def _estimate_baseline_bps(self, df: pd.DataFrame) -> pd.Series:
+        """
+        Estimate baseline BPS from stats when actual BPS data is not available.
+        
+        This uses typical BPS contribution values:
+        - Playing 60+ mins: ~6 points
+        - Passes completed: ~1 per 10 passes
+        - Tackles/interceptions: ~2-3 each
+        - Recoveries: ~1 each
+        - Key passes: ~2 each
+        - etc.
+        """
+        baseline = np.zeros(len(df))
+        
+        # Base for playing 60+ mins
+        baseline += 6  # Base appearance score
+        
+        # Passing contribution (estimate from rolling stats)
+        if 'passes_per90_roll5' in df.columns:
+            passes = df['passes_per90_roll5'].fillna(0) * (df['minutes'].fillna(0) / 90)
+            baseline += passes * 0.1  # ~1 BPS per 10 passes
+        
+        # Key passes
+        if 'key_passes_per90_roll5' in df.columns:
+            key_passes = df['key_passes_per90_roll5'].fillna(0) * (df['minutes'].fillna(0) / 90)
+            baseline += key_passes * 2
+        
+        # Tackles
+        if 'tackles_per90_roll5' in df.columns:
+            tackles = df['tackles_per90_roll5'].fillna(0) * (df['minutes'].fillna(0) / 90)
+            baseline += tackles * 2
+        
+        # Interceptions
+        if 'interceptions_per90_roll5' in df.columns:
+            ints = df['interceptions_per90_roll5'].fillna(0) * (df['minutes'].fillna(0) / 90)
+            baseline += ints * 3
+        
+        # Recoveries
+        if 'recoveries_per90_roll5' in df.columns:
+            recoveries = df['recoveries_per90_roll5'].fillna(0) * (df['minutes'].fillna(0) / 90)
+            baseline += recoveries * 1
+        
+        # SCA (shot creating actions)
+        if 'sca_per90_roll5' in df.columns:
+            sca = df['sca_per90_roll5'].fillna(0) * (df['minutes'].fillna(0) / 90)
+            baseline += sca * 1.5
+        
+        return pd.Series(baseline, index=df.index)
+    
+    def predict(self, df: pd.DataFrame) -> np.ndarray:
+        """Predict baseline BPS."""
+        if not self.is_fitted:
+            raise ValueError("Model not fitted.")
+        
+        df = df.copy()
+        df = self._add_position_features(df)
+        
+        for feat in self._features_used:
+            if feat not in df.columns:
+                df[feat] = 0
+        
+        X = df[self._features_used].fillna(0).astype(float)
+        X_scaled = self.scaler.transform(X)
+        preds = self.model.predict(X_scaled)
+        
+        # Floor at 0
+        return np.maximum(preds, 0)
+    
+    def feature_importance(self) -> pd.DataFrame:
+        if not self.is_fitted:
+            raise ValueError("Model not fitted.")
+        
+        return pd.DataFrame({
+            'feature': self._features_used,
+            'importance': self.model.feature_importances_
+        }).sort_values('importance', ascending=False)
+
+
+class BonusModelMC:
+    """
+    Monte Carlo simulation-based bonus model.
+    
+    Instead of predicting bonus directly, this model:
+    1. Uses a BaselineBPSModel to predict baseline BPS (from "boring" stats)
+    2. Uses existing model predictions (goals, assists, CS probability)
+    3. Runs Monte Carlo simulation to determine bonus from BPS rankings
+    """
+    
+    TARGET = 'bonus'
+    
+    # Class-level FEATURES for compatibility with feature selection
+    FEATURES = BaselineBPSModel.FEATURES.copy()
+    
+    def __init__(self, n_simulations: int = 1000, **xgb_params):
+        self.n_simulations = n_simulations
+        self.baseline_model = BaselineBPSModel(**xgb_params)
+        self.is_fitted = False
+        
+        # Use the class-level FEATURES (which can be modified by feature selection)
+        self.baseline_model.FEATURES = self.__class__.FEATURES.copy()
+    
+    def fit(self, df: pd.DataFrame, verbose: bool = True):
+        """Train the baseline BPS model."""
+        if verbose:
+            print(f"Training BonusModelMC (Monte Carlo, {self.n_simulations} sims)...")
+        
+        self.baseline_model.fit(df, verbose=verbose)
+        self.is_fitted = True
+        self._features_used = self.baseline_model._features_used
+        
+        return self
+    
+    def predict(self, df: pd.DataFrame, 
+                pred_exp_goals: np.ndarray = None,
+                pred_exp_assists: np.ndarray = None,
+                pred_cs_prob: np.ndarray = None,
+                pred_minutes: np.ndarray = None,
+                match_groups: pd.Series = None) -> np.ndarray:
+        """
+        Predict expected bonus using Monte Carlo simulation.
+        
+        Args:
+            df: DataFrame with player data and features
+            pred_exp_goals: Expected goals for each player (from GoalsModel)
+            pred_exp_assists: Expected assists for each player (from AssistsModel)
+            pred_cs_prob: Clean sheet probability for each player's team
+            pred_minutes: Predicted minutes for each player
+            match_groups: Series indicating which match each player is in (e.g., 'team_vs_opponent')
+        
+        Returns:
+            Array of expected bonus points (0-3 range, usually 0-0.5 avg)
+        """
+        if not self.is_fitted:
+            raise ValueError("Model not fitted.")
+        
+        df = df.copy()
+        n_players = len(df)
+        
+        # Get predictions from columns if not provided
+        if pred_exp_goals is None:
+            if 'pred_exp_goals' in df.columns:
+                pred_exp_goals = df['pred_exp_goals'].values
+            elif 'pred_goals_per90' in df.columns:
+                pred_exp_goals = df['pred_goals_per90'].values
+            else:
+                pred_exp_goals = np.zeros(n_players)
+        
+        if pred_exp_assists is None:
+            if 'pred_exp_assists' in df.columns:
+                pred_exp_assists = df['pred_exp_assists'].values
+            elif 'pred_assists_per90' in df.columns:
+                pred_exp_assists = df['pred_assists_per90'].values
+            else:
+                pred_exp_assists = np.zeros(n_players)
+        
+        if pred_cs_prob is None:
+            if 'pred_cs_prob' in df.columns:
+                pred_cs_prob = df['pred_cs_prob'].values
+            else:
+                pred_cs_prob = np.full(n_players, 0.2)
+        
+        if pred_minutes is None:
+            if 'pred_minutes' in df.columns:
+                pred_minutes = df['pred_minutes'].values
+            else:
+                pred_minutes = np.full(n_players, 60)
+        
+        # Predict baseline BPS
+        baseline_bps = self.baseline_model.predict(df)
+        
+        # Scale baseline BPS by predicted minutes (if playing less, lower baseline)
+        # Normalize to 90 mins baseline
+        minutes_factor = np.clip(pred_minutes / 90.0, 0.1, 1.0)
+        baseline_bps = baseline_bps * minutes_factor
+        
+        # Get FPL position for BPS rules
+        fpl_positions = df.get('fpl_position', pd.Series(['MID'] * n_players)).values
+        
+        # Create match groups if not provided
+        if match_groups is None:
+            if 'team' in df.columns and 'opponent' in df.columns:
+                # Group players by match
+                match_groups = df.apply(
+                    lambda r: '_vs_'.join(sorted([str(r.get('team', '')), str(r.get('opponent', ''))])),
+                    axis=1
+                ).values
+            else:
+                # Single match assumption (all players in same match)
+                match_groups = np.array(['match'] * n_players)
+        else:
+            match_groups = match_groups.values if hasattr(match_groups, 'values') else match_groups
+        
+        # Run simulation
+        expected_bonus = self._simulate_bonus(
+            baseline_bps=baseline_bps,
+            exp_goals=pred_exp_goals,
+            exp_assists=pred_exp_assists,
+            cs_prob=pred_cs_prob,
+            fpl_positions=fpl_positions,
+            match_groups=match_groups,
+            pred_minutes=pred_minutes
+        )
+        
+        return expected_bonus
+    
+    def _simulate_bonus(self, baseline_bps: np.ndarray, exp_goals: np.ndarray,
+                        exp_assists: np.ndarray, cs_prob: np.ndarray,
+                        fpl_positions: np.ndarray, match_groups: np.ndarray,
+                        pred_minutes: np.ndarray) -> np.ndarray:
+        """
+        Run Monte Carlo simulation to compute expected bonus.
+        
+        For each simulation:
+        1. Sample goals from Poisson(exp_goals)
+        2. Sample assists from Poisson(exp_assists)
+        3. Sample clean sheets from Bernoulli(cs_prob)
+        4. Calculate total BPS
+        5. Rank within each match and award 3, 2, 1 points
+        """
+        n_players = len(baseline_bps)
+        n_sims = self.n_simulations
+        
+        # Initialize bonus accumulator
+        total_bonus = np.zeros(n_players)
+        
+        # Get unique matches
+        unique_matches = np.unique(match_groups)
+        
+        # Pre-compute position-based BPS values
+        goal_bps = np.array([BPS_RULES['goal'].get(pos, 18) for pos in fpl_positions])
+        cs_bps = np.array([BPS_RULES['clean_sheet'].get(pos, 0) for pos in fpl_positions])
+        
+        # Run simulations
+        for _ in range(n_sims):
+            # Sample major events
+            goals = np.random.poisson(np.maximum(exp_goals, 0))
+            assists = np.random.poisson(np.maximum(exp_assists, 0))
+            clean_sheets = (np.random.random(n_players) < cs_prob).astype(int)
+            
+            # Only award CS if player plays 60+ mins (use predicted minutes)
+            clean_sheets = clean_sheets * (pred_minutes >= 60).astype(int)
+            
+            # Calculate BPS for this simulation
+            sim_bps = (
+                baseline_bps +
+                goals * goal_bps +
+                assists * BPS_RULES['assist'] +
+                clean_sheets * cs_bps
+            )
+            
+            # Award bonus within each match
+            for match_id in unique_matches:
+                match_mask = match_groups == match_id
+                match_indices = np.where(match_mask)[0]
+                
+                if len(match_indices) == 0:
+                    continue
+                
+                # Get BPS for players in this match
+                match_bps = sim_bps[match_indices]
+                
+                # Sort by BPS (descending) and get rankings
+                sorted_indices = np.argsort(-match_bps)
+                
+                # Award bonus: 3 for 1st, 2 for 2nd, 1 for 3rd
+                # Handle ties by awarding same bonus to tied players
+                if len(sorted_indices) >= 1:
+                    # First place gets 3
+                    first_bps = match_bps[sorted_indices[0]]
+                    first_place = match_bps == first_bps
+                    total_bonus[match_indices[first_place]] += 3
+                    
+                    if len(sorted_indices) >= 2:
+                        # Second place gets 2 (if not tied with first)
+                        second_bps = match_bps[sorted_indices[1]]
+                        if second_bps < first_bps:
+                            second_place = match_bps == second_bps
+                            total_bonus[match_indices[second_place]] += 2
+                            
+                            if len(sorted_indices) >= 3:
+                                # Third place gets 1 (if not tied with first or second)
+                                third_bps = match_bps[sorted_indices[2]]
+                                if third_bps < second_bps:
+                                    third_place = match_bps == third_bps
+                                    total_bonus[match_indices[third_place]] += 1
+        
+        # Average across simulations
+        expected_bonus = total_bonus / n_sims
+        
+        return expected_bonus
+    
+    def predict_simple(self, df: pd.DataFrame) -> np.ndarray:
+        """
+        Simple prediction without simulation (fallback).
+        Uses baseline BPS model and heuristics.
+        """
+        if not self.is_fitted:
+            raise ValueError("Model not fitted.")
+        
+        baseline_bps = self.baseline_model.predict(df)
+        
+        # Simple heuristic: higher baseline BPS = more likely to get bonus
+        # Normalize and scale to 0-3 range
+        bps_normalized = np.clip(baseline_bps / 30.0, 0, 1)  # Assume ~30 is a good baseline
+        expected_bonus = bps_normalized * 0.5  # Average player gets ~0.5 bonus
+        
+        return np.clip(expected_bonus, 0, 3)
+    
+    def feature_importance(self) -> pd.DataFrame:
+        """Get feature importance from baseline model."""
+        return self.baseline_model.feature_importance()
+
+
+# Backwards compatibility alias
+BonusModel = BonusModelMC
+

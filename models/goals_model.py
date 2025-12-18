@@ -182,7 +182,7 @@ class GoalsModel:
             df = self.prepare_features(df)
         
         df = df.copy()
-        print(df['team_xg_roll10'])
+        #print(df['team_xg_roll10'])
         
         # Filter to players who actually played (1+ minutes)
         played_mask = df['minutes'] >= 1
@@ -203,8 +203,10 @@ class GoalsModel:
         X_scaled = self.scaler.fit_transform(X)
         
         # Sample weights: upweight goalscorers
-        sample_weights = np.ones(len(y))
-        sample_weights[y > 0] = 2.0
+        # Sample weights: weight by minutes played
+        sample_weights = df_played['minutes'].values.copy()
+        # Normalize so mean weight = 1.0 (keeps same total weight as before)
+        sample_weights = sample_weights / sample_weights.mean()
         
         if verbose:
             print(f"Training GoalsModel (per 90) on {len(X)} samples...")
@@ -213,6 +215,8 @@ class GoalsModel:
         
         self.model.fit(X_scaled, y, sample_weight=sample_weights)
         self.is_fitted = True
+        # Store which features were actually used (matches self.FEATURES after feature selection)
+        self._features_used = self.FEATURES.copy()
         
         if verbose:
             y_pred = self.model.predict(X_scaled)
@@ -252,7 +256,10 @@ class GoalsModel:
         if not self.is_fitted:
             raise ValueError("Model not fitted.")
         
+        # Use _features_used if available (matches what model was trained with)
+        features = getattr(self, '_features_used', self.FEATURES)
+        
         return pd.DataFrame({
-            'feature': self.FEATURES,
+            'feature': features,
             'importance': self.model.feature_importances_
         }).sort_values('importance', ascending=False)

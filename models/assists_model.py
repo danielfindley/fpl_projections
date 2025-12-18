@@ -43,13 +43,37 @@ class AssistsModel:
         'xag_roll3',
         
         # Team context (attacking strength)
+        'team_xg_roll1',
+        'team_goals_roll1',
+        'team_shots_roll1',
+        'team_xg_roll3',
+        'team_goals_roll3',
+        'team_shots_roll3',
         'team_xg_roll5',
         'team_goals_roll5',
         'team_shots_roll5',
+        'team_xg_roll10',
+        'team_goals_roll10',
+        'team_shots_roll10',
+        'team_xg_roll20',
+        'team_goals_roll20',
+        'team_shots_roll20',
         
         # Opponent context (defensive weakness)
         'opp_conceded_roll5',
         'opp_xg_against_roll5',
+        'opp_conceded_roll1',
+        'opp_xg_against_roll1',
+        'opp_shots_roll1',
+        'opp_conceded_roll3',
+        'opp_xg_against_roll3',
+        'opp_shots_roll3',
+        'opp_conceded_roll10',
+        'opp_xg_against_roll10',
+        'opp_shots_roll10',
+        'opp_conceded_roll20',
+        'opp_xg_against_roll20',
+        'opp_shots_roll20',
         
         # Match context
         'is_home',
@@ -173,8 +197,10 @@ class AssistsModel:
         X_scaled = self.scaler.fit_transform(X)
         
         # Sample weights: upweight assist makers
-        sample_weights = np.ones(len(y))
-        sample_weights[y > 0] = 2.0
+        # Sample weights: weight by minutes played
+        sample_weights = df_played['minutes'].values.copy()
+        # Normalize so mean weight = 1.0
+        sample_weights = sample_weights / sample_weights.mean()
         
         if verbose:
             print(f"Training AssistsModel (per 90) on {len(X)} samples...")
@@ -183,6 +209,8 @@ class AssistsModel:
         
         self.model.fit(X_scaled, y, sample_weight=sample_weights)
         self.is_fitted = True
+        # Store which features were actually used (matches self.FEATURES after feature selection)
+        self._features_used = self.FEATURES.copy()
         
         if verbose:
             y_pred = self.model.predict(X_scaled)
@@ -222,7 +250,10 @@ class AssistsModel:
         if not self.is_fitted:
             raise ValueError("Model not fitted.")
         
+        # Use _features_used if available (matches what model was trained with)
+        features = getattr(self, '_features_used', self.FEATURES)
+        
         return pd.DataFrame({
-            'feature': self.FEATURES,
+            'feature': features,
             'importance': self.model.feature_importances_
         }).sort_values('importance', ascending=False)

@@ -366,6 +366,8 @@ class CleanSheetModel:
         
         self.model.fit(X, y)
         self.is_fitted = True
+        # Store which features were actually used (matches self.FEATURES after feature selection)
+        self._features_used = self.FEATURES.copy()
         
         if verbose:
             y_pred_proba = self.model.predict_proba(X)[:, 1]
@@ -392,8 +394,11 @@ class CleanSheetModel:
         if not self.is_fitted:
             raise ValueError("Model not fitted.")
         
+        # Use _features_used if available (matches what model was trained with)
+        features = getattr(self, '_features_used', self.FEATURES)
+        
         return pd.DataFrame({
-            'feature': self.FEATURES,
+            'feature': features,
             'importance': self.model.feature_importances_
         }).sort_values('importance', ascending=False)
 

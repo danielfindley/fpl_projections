@@ -244,8 +244,11 @@ class BonusModel:
             print(f"  Features used: {len(available_features)}")
             print(f"  Avg bonus: {y.mean():.2f}")
             print(f"  Players with bonus > 0: {(y > 0).sum()} ({(y > 0).mean():.1%})")
-        
-        self.model.fit(X_scaled, y)
+        # Sample weights: weight by minutes played
+        sample_weights = df['minutes'].values.copy()  # or df_played if filtered
+        # Normalize so mean weight = 1.0
+        sample_weights = sample_weights / sample_weights.mean()
+        self.model.fit(X_scaled, y, sample_weight=sample_weights)
         self.is_fitted = True
         self._features_used = available_features
         

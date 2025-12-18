@@ -41,7 +41,7 @@ from models.goals_model import GoalsModel
 from models.assists_model import AssistsModel
 from models.defcon_model import DefconModel
 from models.clean_sheet_model import CleanSheetModel
-from models.bonus_model import BonusModel
+from models.bonus_model_mc import BonusModelMC as BonusModel
 
 
 # ============================================================================
@@ -305,6 +305,21 @@ def fetch_fpl_positions(data_dir: Path, player_names: set, verbose: bool = True)
     
     if verbose:
         print(f'  Matched {matched}/{len(player_names)} players to FPL positions')
+    
+    # Manual position overrides (for players that are misclassified or missing)
+    MANUAL_POSITION_OVERRIDES = {
+        'Raúl Jiménez': 'FWD',
+        'Matheus Cunha': 'MID',
+        'Mateus Gonçalo Espanha Fernandes': 'MID',
+    }
+    
+    # Apply manual overrides
+    for player_name, position in MANUAL_POSITION_OVERRIDES.items():
+        if player_name in player_names:
+            old_position = player_positions.get(player_name, 'Unknown')
+            player_positions[player_name] = position
+            if verbose and old_position != position:
+                print(f'  Manual override: {player_name} ({old_position} → {position})')
     
     return player_positions
 
@@ -650,7 +665,11 @@ def fetch_fpl_bonus_data(data_dir: Path, player_names: set, verbose: bool = True
     if len(all_history) > 0:
         fpl_history = pd.DataFrame(all_history)
         fpl_history = fpl_history.rename(columns={'round': 'gameweek'})
-        return fpl_history[['fbref_name', 'gameweek', 'bonus']].copy()
+        # Include bps (raw BPS score) for Monte Carlo bonus model
+        cols = ['fbref_name', 'gameweek', 'bonus']
+        if 'bps' in fpl_history.columns:
+            cols.append('bps')
+        return fpl_history[cols].copy()
     
     return pd.DataFrame()
 
@@ -875,16 +894,20 @@ class FPLPredictionPipeline:
         )
     
     def _split_evaluate_model(self, name: str, model_class, df: pd.DataFrame, 
-                               config: TuneConfig, params: Dict, study, verbose: bool) -> ModelMetrics:
-        """Evaluate a model using train/test split."""
-        # Random split
-        train_df, test_df = train_test_split(
-            df, test_size=config.test_size, random_state=config.random_state
-        )
+                           config: TuneConfig, params: Dict, study, verbose: bool) -> ModelMetrics:
+        """Evaluate a model using temporal train/test split."""
+        # Temporal split by gameweek (train on earlier gameweeks, test on later)
+        # Sort by season and gameweek to ensure chronological order
+        df_sorted = df.sort_values(['season', 'gameweek']).reset_index(drop=True)
+        
+        # Calculate split point based on test_size
+        split_idx = int(len(df_sorted) * (1 - config.test_size))
+        train_df = df_sorted.iloc[:split_idx].copy()
+        test_df = df_sorted.iloc[split_idx:].copy()
         
         if verbose:
-            print(f"  Train samples: {len(train_df):,}")
-            print(f"  Test samples: {len(test_df):,}")
+            print(f"  Train samples: {len(train_df):,} (up to GW{train_df['gameweek'].max() if len(train_df) > 0 else 'N/A'})")
+            print(f"  Test samples: {len(test_df):,} (from GW{test_df['gameweek'].min() if len(test_df) > 0 else 'N/A'})")
         
         # Feature selection if enabled
         selected_features = None
@@ -910,26 +933,26 @@ class FPLPredictionPipeline:
             if selected_features:
                 model_class.FEATURES = selected_features
         
-        # Create and train model
-        model = model_class(**params)
-        model.fit(train_df, verbose=False)
+        # Create and train model on train set for evaluation
+        eval_model = model_class(**params)
+        eval_model.fit(train_df, verbose=False)
         
         # Get predictions and actuals based on model type
         if name == 'minutes':
             y_test = test_df['minutes'].values
-            y_pred = model.predict(test_df)
+            y_pred = eval_model.predict(test_df)
             target_name = 'minutes'
         elif name == 'goals':
             y_test = test_df['goals_per90'].values if 'goals_per90' in test_df.columns else (test_df['goals'] / np.maximum(test_df['minutes'] / 90, 0.01)).values
-            y_pred = model.predict_per90(test_df)
+            y_pred = eval_model.predict_per90(test_df)
             target_name = 'goals_per90'
         elif name == 'assists':
             y_test = test_df['assists_per90'].values if 'assists_per90' in test_df.columns else (test_df['assists'] / np.maximum(test_df['minutes'] / 90, 0.01)).values
-            y_pred = model.predict_per90(test_df)
+            y_pred = eval_model.predict_per90(test_df)
             target_name = 'assists_per90'
         elif name == 'defcon':
             y_test = test_df['defcon_per90'].values if 'defcon_per90' in test_df.columns else (test_df['defcon'] / np.maximum(test_df['minutes'] / 90, 0.01)).values
-            y_pred = model.predict_per90(test_df)
+            y_pred = eval_model.predict_per90(test_df)
             target_name = 'defcon_per90'
         
         # Calculate metrics
@@ -942,8 +965,14 @@ class FPLPredictionPipeline:
             print(f"  Actual mean: {np.mean(y_test):.4f}")
             print(f"  Predicted mean: {np.mean(y_pred):.4f}")
         
-        # Store model
-        self.models[name] = model
+        # Train final model on ALL data for production use
+        if verbose:
+            print(f"  Training final model on all {len(df):,} samples...")
+        final_model = model_class(**params)
+        final_model.fit(df, verbose=False)
+        
+        # Store final model (trained on all data)
+        self.models[name] = final_model
         
         return ModelMetrics(
             model_name=name,
@@ -951,7 +980,7 @@ class FPLPredictionPipeline:
             rmse=rmse,
             r2=r2,
             samples=len(test_df),
-            feature_importance=model.feature_importance() if hasattr(model, 'feature_importance') else None,
+            feature_importance=final_model.feature_importance() if hasattr(final_model, 'feature_importance') else None,
             selected_features=selected_features,
             best_params=params if config.optuna_trials > 0 else None,
             optuna_study=study
@@ -1079,7 +1108,8 @@ class FPLPredictionPipeline:
                               target_col: str, k: int, verbose: bool) -> List[str]:
         """Select features using Recursive Feature Elimination."""
         import xgboost as xgb
-        
+        available_features = [f for f in features if f in df.columns]
+        features = available_features
         if verbose:
             print(f"  Feature selection: RFE (top {k} features)")
         
@@ -1242,21 +1272,52 @@ class FPLPredictionPipeline:
             return self._split_evaluate_bonus_model(bonus_df, config, params, study, verbose)
     
     def _split_evaluate_bonus_model(self, df: pd.DataFrame, config: TuneConfig, 
-                                     params: Dict, study, verbose: bool) -> ModelMetrics:
+                                 params: Dict, study, verbose: bool) -> ModelMetrics:
         """Evaluate bonus model using train/test split."""
-        train_df, test_df = train_test_split(
-            df, test_size=config.test_size, random_state=config.random_state
-        )
+        # Temporal split by gameweek
+        df_sorted = df.sort_values(['season', 'gameweek']).reset_index(drop=True)
+        split_idx = int(len(df_sorted) * (1 - config.test_size))
+        train_df = df_sorted.iloc[:split_idx].copy()
+        test_df = df_sorted.iloc[split_idx:].copy()
         
         if verbose:
-            print(f"  Train samples: {len(train_df):,}")
-            print(f"  Test samples: {len(test_df):,}")
+            print(f"  Train samples: {len(train_df):,} (up to GW{train_df['gameweek'].max() if len(train_df) > 0 else 'N/A'})")
+            print(f"  Test samples: {len(test_df):,} (from GW{test_df['gameweek'].min() if len(test_df) > 0 else 'N/A'})")
         
-        model = BonusModel(**params)
-        model.fit(train_df, verbose=False)
+        # Feature selection if enabled
+        selected_features = None
+        if config.feature_selection != 'none':
+            temp_model = BonusModel(n_simulations=100, **params)  # Few sims for feature selection
+            original_features = temp_model.FEATURES.copy()
+            
+            if config.feature_selection == 'importance':
+                selected_features = self._select_features_importance(
+                    BonusModel, train_df, original_features,
+                    temp_model.TARGET, config.feature_selection_k, params, verbose
+                )
+            elif config.feature_selection == 'rfe':
+                target_col = temp_model.TARGET
+                selected_features = self._select_features_rfe(
+                    train_df, original_features, target_col, 
+                    config.feature_selection_k, verbose
+                )
+            
+            if selected_features:
+                BonusModel.FEATURES = selected_features
+        
+        # Create and train model on train set for evaluation
+        eval_model = BonusModel(n_simulations=500, **params)  # Fewer sims for faster tuning
+        eval_model.fit(train_df, verbose=False)
         
         y_test = test_df['bonus'].values
-        y_pred = model.predict(test_df)
+        # For tuning, use simple prediction (no other model predictions available)
+        # Use historical averages as proxies for predictions
+        test_df_copy = test_df.copy()
+        test_df_copy['pred_exp_goals'] = test_df_copy.get('xg_per90_roll5', 0).fillna(0) * 0.5
+        test_df_copy['pred_exp_assists'] = test_df_copy.get('xag_per90_roll5', 0).fillna(0) * 0.5
+        test_df_copy['pred_cs_prob'] = 0.25  # Default CS prob
+        test_df_copy['pred_minutes'] = test_df_copy.get('roll5_minutes_avg', 60).fillna(60)
+        y_pred = eval_model.predict(test_df_copy)
         
         mae = mean_absolute_error(y_test, y_pred)
         rmse = np.sqrt(mean_squared_error(y_test, y_pred))
@@ -1267,7 +1328,13 @@ class FPLPredictionPipeline:
             print(f"  Actual mean: {np.mean(y_test):.4f}")
             print(f"  Predicted mean: {np.mean(y_pred):.4f}")
         
-        self.models['bonus'] = model
+        # Train final model on ALL data
+        if verbose:
+            print(f"  Training final model on all {len(df):,} samples...")
+        final_model = BonusModel(n_simulations=1000, **params)  # Full sims for final model
+        final_model.fit(df, verbose=False)
+        
+        self.models['bonus'] = final_model
         
         return ModelMetrics(
             model_name='bonus',
@@ -1275,13 +1342,13 @@ class FPLPredictionPipeline:
             rmse=rmse,
             r2=r2,
             samples=len(test_df),
-            feature_importance=model.feature_importance(),
+            feature_importance=final_model.feature_importance(),
+            selected_features=selected_features,
             best_params=params if config.optuna_trials > 0 else None,
             optuna_study=study
         )
-    
     def _cv_evaluate_bonus_model(self, df: pd.DataFrame, config: TuneConfig,
-                                  params: Dict, study, verbose: bool) -> ModelMetrics:
+                                params: Dict, study, verbose: bool) -> ModelMetrics:
         """Evaluate bonus model using cross-validation."""
         kf = KFold(n_splits=config.cv_folds, shuffle=True, random_state=config.random_state)
         
@@ -1289,17 +1356,43 @@ class FPLPredictionPipeline:
         cv_rmses = []
         cv_r2s = []
         
+        # Feature selection if enabled (do once before CV)
+        selected_features = None
+        if config.feature_selection != 'none':
+            temp_model = BonusModel(n_simulations=100, **params)  # Few sims for feature selection
+            original_features = temp_model.FEATURES.copy()
+            
+            if config.feature_selection == 'importance':
+                selected_features = self._select_features_importance(
+                    BonusModel, df, original_features,  # FIX: Use BonusModel, not model_class
+                    temp_model.TARGET, config.feature_selection_k, params, verbose
+                )
+            elif config.feature_selection == 'rfe':
+                target_col = temp_model.TARGET
+                selected_features = self._select_features_rfe(
+                    df, original_features, target_col, 
+                    config.feature_selection_k, verbose
+                )
+            
+            if selected_features:
+                BonusModel.FEATURES = selected_features  # FIX: Use BonusModel, not model_class
+        
         if verbose:
             print(f"  Running {config.cv_folds}-fold cross-validation...")
         
         for fold, (train_idx, test_idx) in enumerate(kf.split(df)):
-            train_df = df.iloc[train_idx]
-            test_df = df.iloc[test_idx]
+            train_df = df.iloc[train_idx].copy()
+            test_df = df.iloc[test_idx].copy()
             
-            model = BonusModel(**params)
+            model = BonusModel(n_simulations=500, **params)  # Fewer sims for faster tuning
             model.fit(train_df, verbose=False)
             
             y_test = test_df['bonus'].values
+            # For tuning, use historical averages as proxies for predictions
+            test_df['pred_exp_goals'] = test_df.get('xg_per90_roll5', 0).fillna(0) * 0.5
+            test_df['pred_exp_assists'] = test_df.get('xag_per90_roll5', 0).fillna(0) * 0.5
+            test_df['pred_cs_prob'] = 0.25  # Default CS prob
+            test_df['pred_minutes'] = test_df.get('roll5_minutes_avg', 60).fillna(60)
             y_pred = model.predict(test_df)
             
             mae = mean_absolute_error(y_test, y_pred)
@@ -1314,7 +1407,7 @@ class FPLPredictionPipeline:
                 print(f"    Fold {fold+1}: MAE={mae:.4f}, RMSE={rmse:.4f}, R²={r2:.4f}")
         
         # Train final model on all data
-        final_model = BonusModel(**params)
+        final_model = BonusModel(n_simulations=1000, **params)  # Full sims for final model
         final_model.fit(df, verbose=False)
         self.models['bonus'] = final_model
         
@@ -1326,6 +1419,7 @@ class FPLPredictionPipeline:
             samples=len(df),
             cv_scores=cv_maes,
             feature_importance=final_model.feature_importance(),
+            selected_features=selected_features,  # FIX: Add this
             best_params=params if config.optuna_trials > 0 else None,
             optuna_study=study
         )
@@ -1419,32 +1513,60 @@ class FPLPredictionPipeline:
     def _train_minutes_model(self, verbose: bool):
         if verbose:
             print('[4] Training minutes model...')
-        self.models['minutes'] = MinutesModel()
-        self.models['minutes'].fit(self.train_df, verbose=verbose)
+        
+        # Check if model already exists (from tuning)
+        if 'minutes' in self.models and self.models['minutes'].is_fitted:
+            if verbose:
+                print('  Using existing tuned minutes model')
+        else:
+            self.models['minutes'] = MinutesModel()
+            self.models['minutes'].fit(self.train_df, verbose=verbose)
+        
         self.test_df['pred_minutes'] = self.models['minutes'].predict(self.test_df)
         self.train_df['pred_minutes'] = self.models['minutes'].predict(self.train_df)
     
     def _train_goals_model(self, verbose: bool):
         if verbose:
             print('[5] Training goals model...')
-        self.models['goals'] = GoalsModel()
-        self.models['goals'].fit(self.train_df, verbose=verbose)
+        
+        # Check if model already exists (from tuning)
+        if 'goals' in self.models and self.models['goals'].is_fitted:
+            if verbose:
+                print('  Using existing tuned goals model')
+        else:
+            self.models['goals'] = GoalsModel()
+            self.models['goals'].fit(self.train_df, verbose=verbose)
+        
         self.test_df['pred_goals_per90'] = self.models['goals'].predict_per90(self.test_df)
         self.test_df['pred_exp_goals'] = self.models['goals'].predict_expected(self.test_df, self.test_df['pred_minutes'].values)
     
     def _train_assists_model(self, verbose: bool):
         if verbose:
             print('[6] Training assists model...')
-        self.models['assists'] = AssistsModel()
-        self.models['assists'].fit(self.train_df, verbose=verbose)
+        
+        # Check if model already exists (from tuning)
+        if 'assists' in self.models and self.models['assists'].is_fitted:
+            if verbose:
+                print('  Using existing tuned assists model')
+        else:
+            self.models['assists'] = AssistsModel()
+            self.models['assists'].fit(self.train_df, verbose=verbose)
+        
         self.test_df['pred_assists_per90'] = self.models['assists'].predict_per90(self.test_df)
         self.test_df['pred_exp_assists'] = self.models['assists'].predict_expected(self.test_df, self.test_df['pred_minutes'].values)
     
     def _train_defcon_model(self, verbose: bool):
         if verbose:
             print('[7] Training defcon model...')
-        self.models['defcon'] = DefconModel()
-        self.models['defcon'].fit(self.train_df, verbose=verbose)
+        
+        # Check if model already exists (from tuning)
+        if 'defcon' in self.models and self.models['defcon'].is_fitted:
+            if verbose:
+                print('  Using existing tuned defcon model')
+        else:
+            self.models['defcon'] = DefconModel()
+            self.models['defcon'].fit(self.train_df, verbose=verbose)
+        
         self.test_df['pred_defcon_per90'] = self.models['defcon'].predict_per90(self.test_df)
         self.test_df['pred_exp_defcon'] = self.models['defcon'].predict_expected(self.test_df, self.test_df['pred_minutes'].values)
         self.test_df['pred_defcon_prob'] = self.models['defcon'].predict_proba_above_threshold(self.test_df, self.test_df['pred_minutes'].values)
@@ -1760,29 +1882,60 @@ class FPLPredictionPipeline:
     
     def _train_bonus_model(self, verbose: bool):
         if verbose:
-            print('[8.5] Training bonus model...')
+            print('[8.5] Training bonus model (Monte Carlo simulation)...')
         
+        # Check if model already exists (from tuning)
+        if 'bonus' in self.models and self.models['bonus'].is_fitted:
+            if verbose:
+                print('  Using existing tuned bonus model')
+            # Predict using the existing tuned model
+            self.test_df['pred_bonus'] = self.models['bonus'].predict(
+                self.test_df,
+                pred_exp_goals=self.test_df['pred_exp_goals'].values,
+                pred_exp_assists=self.test_df['pred_exp_assists'].values,
+                pred_cs_prob=self.test_df['pred_cs_prob'].values,
+                pred_minutes=self.test_df['pred_minutes'].values,
+            )
+            if verbose:
+                print(f'  Monte Carlo simulation complete')
+                print(f'  Avg predicted bonus: {self.test_df["pred_bonus"].mean():.3f}')
+            return
+        
+        # Train new model if not already tuned
         unique_players = set(self.train_df['player_name'].unique()) | set(self.test_df['player_name'].unique())
         fpl_bonus = fetch_fpl_bonus_data(self.data_dir, unique_players, verbose)
         
         if len(fpl_bonus) > 0:
             current_season_train = self.train_df[self.train_df['season'] == '2025-26'].copy()
-            current_season_train = current_season_train.merge(fpl_bonus, left_on=['player_name', 'gameweek'], right_on=['fbref_name', 'gameweek'], how='left')
+            current_season_train = current_season_train.merge(
+                fpl_bonus, 
+                left_on=['player_name', 'gameweek'], 
+                right_on=['fbref_name', 'gameweek'], 
+                how='left'
+            )
             current_season_train['bonus'] = current_season_train['bonus'].fillna(0)
-            
-            # current_season_train['pred_goal_prob'] = current_season_train['xg_per90_roll5'].fillna(0).clip(0, 1)
-            # current_season_train['pred_assist_prob'] = current_season_train['xag_per90_roll5'].fillna(0).clip(0, 1)
-            # current_season_train['pred_defcon_prob'] = current_season_train['hit_threshold_roll5'].fillna(0)
-            # current_season_train['pred_minutes'] = current_season_train['roll5_minutes_avg'].fillna(60)
+            if 'bps' in current_season_train.columns:
+                current_season_train['bps'] = current_season_train['bps'].fillna(0)
             
             train_bonus_df = current_season_train[current_season_train['minutes'] >= 60].copy()
             
-            self.models['bonus'] = BonusModel()
+            # Train the Monte Carlo bonus model (fits baseline BPS model)
+            self.models['bonus'] = BonusModel(n_simulations=1000)
             self.models['bonus'].fit(train_bonus_df, verbose=verbose)
             
-            # self.test_df['pred_goal_prob'] = self.test_df['pred_exp_goals'].clip(0, 1)
-            # self.test_df['pred_assist_prob'] = self.test_df['pred_exp_assists'].clip(0, 1)
-            self.test_df['pred_bonus'] = self.models['bonus'].predict(self.test_df)
+            # Predict using Monte Carlo simulation with our model predictions
+            # Use the predictions already computed by goals, assists, CS, minutes models
+            self.test_df['pred_bonus'] = self.models['bonus'].predict(
+                self.test_df,
+                pred_exp_goals=self.test_df['pred_exp_goals'].values,
+                pred_exp_assists=self.test_df['pred_exp_assists'].values,
+                pred_cs_prob=self.test_df['pred_cs_prob'].values,
+                pred_minutes=self.test_df['pred_minutes'].values,
+            )
+            
+            if verbose:
+                print(f'  Monte Carlo simulation complete')
+                print(f'  Avg predicted bonus: {self.test_df["pred_bonus"].mean():.3f}')
         else:
             self.test_df['pred_bonus'] = 0
     
