@@ -6,6 +6,11 @@ Key insight: Among players who play, minutes are heavily skewed toward 90.
 - ~50% play 90 minutes (full game)
 - ~65% play 60+ minutes (starters)
 - The remaining ~35% are subs playing 1-30 minutes
+
+Now includes FPL API availability features:
+- Status flags (available, injured, unavailable, doubtful, suspended)
+- Chance of playing next round (0-100%)
+- Hard filter for 0% chance or injured/unavailable status
 """
 
 import pandas as pd
@@ -20,6 +25,13 @@ class MinutesModel:
     """
     XGBoost model that predicts minutes assuming player WILL play.
     Uses heavy weighting on 90-minute outcomes since they dominate the distribution.
+    
+    Includes FPL API availability features for prediction mode:
+    - fpl_chance_of_playing: Numerical 0-100
+    - fpl_status_* flags: One-hot encoded availability status
+    
+    Hard filter applied: players with 0% chance or injured/unavailable status
+    get pred_minutes = 0.
     """
     
     FEATURES = [
@@ -38,6 +50,11 @@ class MinutesModel:
         'starter_score',
         'full_90_rate',
         
+        # LIFETIME PLAYER PROFILE (career-long stats for minutes prediction)
+        'lifetime_minutes',                   # Total career minutes (experience indicator)
+        'lifetime_minutes_per_appearance',    # Avg minutes when playing (consistency)
+        'lifetime_goal_involvements_per90',   # Career G+A per 90 (player quality indicator)
+        
         # Productivity
         'goals_roll5',
         'assists_roll5',
@@ -54,7 +71,21 @@ class MinutesModel:
         
         # Team context
         'team_goals_roll5',
+        
+        # FPL API availability features (used in prediction only)
+        # Numerical: chance of playing (0-100, scaled to 0-1)
+        'fpl_chance_of_playing_scaled',
+        
+        # One-hot status flags
+        'fpl_status_available',
+        'fpl_status_injured',
+        'fpl_status_unavailable',
+        'fpl_status_doubtful',
+        'fpl_status_suspended',
     ]
+    
+    # Features used during training (historical data doesn't have FPL status)
+    TRAINING_FEATURES = [f for f in FEATURES if not f.startswith('fpl_')]
     
     # Map notebook feature names to model feature names
     FEATURE_ALIASES = {
@@ -65,7 +96,15 @@ class MinutesModel:
     
     TARGET = 'minutes'
     
-    def __init__(self, **xgb_params):
+    def __init__(self, use_fpl_status: bool = True, **xgb_params):
+        """
+        Initialize MinutesModel.
+        
+        Args:
+            use_fpl_status: If True, use FPL availability features during prediction
+                           and apply hard filters. Default True.
+            **xgb_params: XGBoost parameters
+        """
         default_params = {
             'n_estimators': 200,
             'max_depth': 4,
@@ -78,6 +117,7 @@ class MinutesModel:
         self.scaler = StandardScaler()
         self.is_fitted = False
         self.train_mean = 67.0
+        self.use_fpl_status = use_fpl_status
     
     def _add_position_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Add position indicator features."""
@@ -239,10 +279,50 @@ class MinutesModel:
             if feat not in df.columns:
                 df[feat] = 0
         
+        # Add FPL status features (defaults for training data)
+        df = self._add_fpl_status_features(df)
+        
+        return df
+    
+    def _add_fpl_status_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add FPL availability status features.
+        
+        For training data (historical), these default to 'available' status.
+        For prediction data, these should be populated from FPL API.
+        """
+        df = df.copy()
+        
+        # Scale chance of playing to 0-1 range
+        if 'fpl_chance_of_playing' in df.columns:
+            df['fpl_chance_of_playing_scaled'] = df['fpl_chance_of_playing'].fillna(100) / 100.0
+        elif 'fpl_chance_of_playing_scaled' not in df.columns:
+            df['fpl_chance_of_playing_scaled'] = 1.0  # Default: 100% available
+        
+        # One-hot status flags (defaults to available for training data)
+        status_cols = {
+            'fpl_status_available': 1,  # Default: available
+            'fpl_status_injured': 0,
+            'fpl_status_unavailable': 0,
+            'fpl_status_doubtful': 0,
+            'fpl_status_suspended': 0,
+        }
+        
+        for col, default in status_cols.items():
+            if col not in df.columns:
+                df[col] = default
+            else:
+                df[col] = df[col].fillna(default)
+        
         return df
     
     def fit(self, df: pd.DataFrame, verbose: bool = True):
-        """Train the model on players who played at least 1 minute."""
+        """
+        Train the model on players who played at least 1 minute.
+        
+        Note: Training uses TRAINING_FEATURES (without FPL status) since
+        historical data doesn't have FPL API status information.
+        """
         # Check if features are already computed (from notebook)
         has_precomputed = all(feat in df.columns for feat in ['roll5_minutes_avg', 'roll5_full_90s', 'full_90_rate'])
         
@@ -259,7 +339,12 @@ class MinutesModel:
         has_history = df_played['last_game_minutes'].notna()
         df_played = df_played[has_history].copy()
         
-        X = df_played[self.FEATURES].fillna(0).astype(float)
+        # Use TRAINING_FEATURES for fit (no FPL status in historical data)
+        # However, if this model was created with modified FEATURES via feature selection,
+        # use those features filtered to exclude FPL ones
+        training_features = [f for f in self.FEATURES if not f.startswith('fpl_')]
+        
+        X = df_played[training_features].fillna(0).astype(float)
         y = df_played[self.TARGET]
         
         # Learn the distribution
@@ -279,6 +364,7 @@ class MinutesModel:
         
         if verbose:
             print(f"Training MinutesModel on {len(X)} samples (players who played 1+ min)...")
+            print(f"  Features used: {len(training_features)} (excluding FPL status for training)")
             print(f"  Actual distribution:")
             print(f"    Mean: {y.mean():.1f}, Median: {y.median():.1f}")
             print(f"    90 min: {(y >= 89).sum()} ({(y >= 89).mean():.1%})")
@@ -287,7 +373,8 @@ class MinutesModel:
         
         self.model.fit(X_scaled, y, sample_weight=sample_weights)
         self.is_fitted = True
-        # Store which features were actually used (matches self.FEATURES after feature selection)
+        # Store which features were actually used for training
+        self._training_features_used = training_features
         self._features_used = self.FEATURES.copy()
         
         if verbose:
@@ -302,16 +389,34 @@ class MinutesModel:
         
         return self
     
-    def predict(self, df: pd.DataFrame) -> np.ndarray:
-        """Predict expected minutes."""
+    def predict(self, df: pd.DataFrame, apply_fpl_filter: bool = True, 
+                verbose: bool = False) -> np.ndarray:
+        """
+        Predict expected minutes.
+        
+        Args:
+            df: DataFrame with player features
+            apply_fpl_filter: If True and use_fpl_status is enabled, apply hard
+                             filters for injured/unavailable players. Default True.
+            verbose: If True, print details about filtered players.
+        
+        Returns:
+            Array of predicted minutes. Players with 0% chance or
+            injured/unavailable status get 0 minutes.
+        """
         if not self.is_fitted:
             raise ValueError("Model not fitted. Call fit() first.")
         
         # For prediction, DON'T recompute rolling features - use what's in the dataframe
         # The notebook already computed these on the full history
         df = self.prepare_features(df, compute_rolling=False)
+        df = df.copy()
         
-        X = df[self.FEATURES].fillna(0).astype(float)
+        # Use training features for model prediction (same features used during fit)
+        training_features = getattr(self, '_training_features_used', 
+                                    [f for f in self.FEATURES if not f.startswith('fpl_')])
+        
+        X = df[training_features].fillna(0).astype(float)
         X_scaled = self.scaler.transform(X)
         
         # Get raw predictions
@@ -329,15 +434,86 @@ class MinutesModel:
             elif roll5_avg[i] >= 55:
                 preds[i] = max(preds[i], 70)
         
-        return np.clip(preds, 1, 90)
+        preds = np.clip(preds, 1, 90)
+        
+        # Apply FPL availability filter if enabled
+        if apply_fpl_filter and self.use_fpl_status:
+            preds = self._apply_fpl_availability_filter(df, preds, verbose)
+        
+        return preds
+    
+    def _apply_fpl_availability_filter(self, df: pd.DataFrame, preds: np.ndarray,
+                                        verbose: bool = False) -> np.ndarray:
+        """
+        Apply hard filter based on FPL availability status.
+        
+        Rules:
+        - fpl_chance_of_playing == 0: Set to 0 minutes
+        - fpl_status in ('i', 'u', 's'): Set to 0 minutes (injured, unavailable, suspended)
+        - fpl_chance_of_playing < 25: Set to 0 minutes
+        - fpl_chance_of_playing 25-74: Scale down by chance/100
+        """
+        preds = preds.copy()
+        
+        # Get FPL status columns
+        chance = df.get('fpl_chance_of_playing', pd.Series([100] * len(df))).fillna(100).values
+        status = df.get('fpl_status', pd.Series(['a'] * len(df))).fillna('a').values
+        
+        # Track which players were filtered
+        filtered_zero = []
+        filtered_scaled = []
+        
+        for i in range(len(preds)):
+            player_chance = chance[i]
+            player_status = status[i]
+            original_pred = preds[i]
+            
+            # Hard filter: 0% chance or injured/unavailable/suspended
+            if player_chance == 0 or player_status in ('i', 'u', 's'):
+                preds[i] = 0
+                if verbose and original_pred > 0:
+                    name = df.iloc[i].get('player_name', f'Player_{i}')
+                    filtered_zero.append((name, player_status, player_chance, original_pred))
+            
+            # Low chance filter: <25% -> 0
+            elif player_chance < 25:
+                preds[i] = 0
+                if verbose and original_pred > 0:
+                    name = df.iloc[i].get('player_name', f'Player_{i}')
+                    filtered_zero.append((name, player_status, player_chance, original_pred))
+            
+            # Medium chance filter: 25-74% -> scale down
+            elif player_chance < 75:
+                scaled = original_pred * (player_chance / 100)
+                preds[i] = scaled
+                if verbose:
+                    name = df.iloc[i].get('player_name', f'Player_{i}')
+                    filtered_scaled.append((name, player_status, player_chance, original_pred, scaled))
+        
+        if verbose:
+            if filtered_zero:
+                print(f"  [MinutesModel] Zeroed {len(filtered_zero)} players due to FPL status:")
+                for name, status, chance, orig in filtered_zero[:10]:
+                    print(f"    {name:25s} (status={status}, chance={chance}%, was {orig:.0f})")
+                if len(filtered_zero) > 10:
+                    print(f"    ... and {len(filtered_zero) - 10} more")
+            
+            if filtered_scaled:
+                print(f"  [MinutesModel] Scaled {len(filtered_scaled)} players due to FPL doubt:")
+                for name, status, chance, orig, scaled in filtered_scaled[:5]:
+                    print(f"    {name:25s} (chance={chance}%, {orig:.0f} -> {scaled:.0f})")
+        
+        return preds
     
     def feature_importance(self) -> pd.DataFrame:
         """Get feature importance."""
         if not self.is_fitted:
             raise ValueError("Model not fitted.")
         
-        # Use _features_used if available (matches what model was trained with)
-        features = getattr(self, '_features_used', self.FEATURES)
+        # Use _training_features_used (features the model was actually trained on)
+        # This excludes FPL status features which aren't used during training
+        features = getattr(self, '_training_features_used', 
+                          [f for f in self.FEATURES if not f.startswith('fpl_')])
         
         return pd.DataFrame({
             'feature': features,

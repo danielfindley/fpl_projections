@@ -40,12 +40,75 @@ BPS_RULES = {
 }
 
 
+def normalize_team_name(name: str) -> str:
+    """
+    Normalize team name for consistent match grouping.
+    
+    Handles variations like:
+    - 'brighton__hove_albion' vs 'Brighton'
+    - 'manchester_city' vs 'Man City'
+    - 'manchester_united' vs 'Man Utd'
+    """
+    if pd.isna(name):
+        return ''
+    
+    name = str(name).lower().strip()
+    # Replace underscores with spaces and normalize whitespace
+    name = name.replace('_', ' ').replace('  ', ' ').strip()
+    
+    # Canonical mappings - map all variations to a standard short name
+    mappings = {
+        # Full names to short
+        'brighton hove albion': 'brighton',
+        'brighton  hove albion': 'brighton',
+        'manchester city': 'man city',
+        'manchester united': 'man utd',
+        'tottenham hotspur': 'spurs',
+        'tottenham': 'spurs',
+        'wolverhampton wanderers': 'wolves',
+        'wolverhampton': 'wolves',
+        'nottingham forest': 'forest',
+        'nottham forest': 'forest',
+        "nott'm forest": 'forest',
+        'newcastle united': 'newcastle',
+        'west ham united': 'west ham',
+        'crystal palace': 'palace',
+        'aston villa': 'villa',
+        'leeds united': 'leeds',
+        'leicester city': 'leicester',
+        # Short variations
+        'man city': 'man city',
+        'man utd': 'man utd',
+    }
+    
+    # Check exact matches first
+    if name in mappings:
+        return mappings[name]
+    
+    # Check partial matches
+    for full_name, short_name in mappings.items():
+        if full_name in name:
+            return short_name
+    
+    # Default: return first word (handles most cases like 'arsenal', 'chelsea', etc.)
+    # But keep two-word names that aren't in mappings
+    words = name.split()
+    if len(words) == 1:
+        return words[0]
+    elif len(words) == 2 and words[0] in ['west', 'man', 'aston', 'crystal', 'leeds', 'leicester']:
+        return name  # Keep compound names
+    else:
+        return words[0]  # Just first word for long names
+
+
 class BaselineBPSModel:
     """
     Predicts baseline BPS score from "boring" stats.
     
     This excludes goals, assists, and clean sheets - those are simulated separately.
     Baseline BPS comes from: passes, tackles, recoveries, saves, etc.
+    
+    Also includes yellow/red card history since cards reduce BPS (-3 for yellow, -9 for red).
     """
     
     FEATURES = [
@@ -78,6 +141,25 @@ class BaselineBPSModel:
         'shots_per90_roll5',
         'shots_per90_roll3',
         'shots_on_target_per90_roll5',
+        
+        # Yellow/Red card history (negative BPS contributors: -3 yellow, -9 red)
+        'yellow_cards_roll5',       # Yellow cards in last 5 games
+        'yellow_cards_roll10',      # Yellow cards in last 10 games
+        'yellow_card_rate',         # Cards per game rate
+        'red_cards_roll20',         # Red cards in last 20 games (rare)
+        
+        # LIFETIME PLAYER PROFILE (career-long stats)
+        'lifetime_goals_per90',             # Career goals per 90 mins
+        'lifetime_assists_per90',           # Career assists per 90 mins
+        'lifetime_xg_per90',                # Career xG per 90 mins
+        'lifetime_xag_per90',               # Career xAG per 90 mins
+        'lifetime_key_passes_per90',        # Career key passes per 90 mins
+        'lifetime_sca_per90',               # Career SCA per 90 mins
+        'lifetime_gca_per90',               # Career GCA per 90 mins
+        'lifetime_defcon_per90',            # Career defensive contribution per 90
+        'lifetime_tackles_per90',           # Career tackles per 90 mins
+        'lifetime_interceptions_per90',     # Career interceptions per 90 mins
+        'lifetime_minutes',                 # Total career minutes (experience indicator)
         
         # Position indicators (different baseline BPS by position)
         'is_forward',
@@ -423,9 +505,12 @@ class BonusModelMC:
         # Create match groups if not provided
         if match_groups is None:
             if 'team' in df.columns and 'opponent' in df.columns:
-                # Group players by match
+                # Group players by match - NORMALIZE team names to ensure both teams match
                 match_groups = df.apply(
-                    lambda r: '_vs_'.join(sorted([str(r.get('team', '')), str(r.get('opponent', ''))])),
+                    lambda r: '_vs_'.join(sorted([
+                        normalize_team_name(r.get('team', '')), 
+                        normalize_team_name(r.get('opponent', ''))
+                    ])),
                     axis=1
                 ).values
             else:

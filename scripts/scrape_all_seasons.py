@@ -24,6 +24,8 @@ from pathlib import Path
 from io import StringIO
 from datetime import datetime
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 # =============================================================================
 # CONFIGURATION
@@ -47,29 +49,10 @@ SEASON_URLS = {
 DATA_DIR = Path("data")
 RAW_HTML_DIR = DATA_DIR / "raw_html"  # Store raw HTML for re-parsing
 
-# Table indices for each stat type (home team first, then away team)
-TABLE_MAPPING = {
-    # Home team tables
-    "home": {
-        "summary": 0,
-        "passing": 1,
-        "pass_types": 2,
-        "defense": 3,
-        "possession": 4,
-        "misc": 5,
-    },
-    # Away team tables (offset by 6)
-    "away": {
-        "summary": 6,
-        "passing": 7,
-        "pass_types": 8,
-        "defense": 9,
-        "possession": 10,
-        "misc": 11,
-    }
-}
+# Stat types to scrape (used for table ID matching)
+STAT_TYPES = ["summary", "passing", "pass_types", "defense", "possession", "misc"]
 
-REQUEST_DELAY = 4  # Seconds between requests
+REQUEST_DELAY = 3  # Seconds between requests (reduced from 4)
 
 
 # =============================================================================
@@ -108,6 +91,51 @@ def parse_gameweek_from_url_or_page(driver, match_url):
     except:
         pass
     return None
+
+
+def extract_tables_by_id(html):
+    """
+    Extract stat tables by their IDs instead of relying on position.
+    
+    FBRef uses table IDs like:
+        - stats_{team_id}_summary
+        - stats_{team_id}_passing
+        - stats_{team_id}_pass_types
+        - stats_{team_id}_defense
+        - stats_{team_id}_possession
+        - stats_{team_id}_misc
+    
+    Returns dict: {team_id: {stat_type: DataFrame}}
+    """
+    from bs4 import BeautifulSoup
+    
+    soup = BeautifulSoup(html, 'html.parser')
+    
+    # Find all tables with stats IDs
+    team_tables = {}
+    
+    for stat_type in STAT_TYPES:
+        # Find tables matching the pattern stats_*_{stat_type}
+        pattern = re.compile(f'stats_[a-z0-9]+_{stat_type}')
+        
+        for table in soup.find_all('table', id=pattern):
+            table_id = table.get('id', '')
+            # Extract team_id from the table ID (e.g., "stats_822bd0ba_summary" -> "822bd0ba")
+            match = re.match(r'stats_([a-z0-9]+)_' + stat_type, table_id)
+            if match:
+                team_id = match.group(1)
+                
+                if team_id not in team_tables:
+                    team_tables[team_id] = {}
+                
+                # Parse the table with pandas
+                try:
+                    df = pd.read_html(StringIO(str(table)))[0]
+                    team_tables[team_id][stat_type] = df
+                except Exception as e:
+                    print(f"      [WARN] Failed to parse {table_id}: {e}")
+    
+    return team_tables
 
 
 def get_match_metadata(row):
@@ -174,7 +202,10 @@ class FBRefSeasonScraper:
     def _init_driver(self):
         if self.driver is None:
             print("[*] Starting Chrome driver...")
-            self.driver = uc.Chrome(version_main=142)
+            # Let undetected_chromedriver auto-detect Chrome version
+            options = uc.ChromeOptions()
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            self.driver = uc.Chrome(options=options)
     
     def _close_driver(self):
         if self.driver:
@@ -189,7 +220,17 @@ class FBRefSeasonScraper:
         
         self._init_driver()
         self.driver.get(url)
-        time.sleep(5)
+        
+        # Wait for the schedule table to actually be present (up to 20 seconds)
+        try:
+            WebDriverWait(self.driver, 20).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, 'table[id*="sched"]'))
+            )
+        except:
+            print("[WARN] Table took too long to load, continuing anyway...")
+        
+        # Additional buffer for JS to finish rendering
+        time.sleep(2)
         
         fixtures = []
         
@@ -233,6 +274,15 @@ class FBRefSeasonScraper:
         try:
             self._init_driver()
             self.driver.get(url)
+            
+            # Wait for stat tables to load (look for any stats table)
+            try:
+                WebDriverWait(self.driver, 20).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, 'table[id*="stats_"]'))
+                )
+            except:
+                print(f"    [WARN] Stats tables took too long to load")
+            
             time.sleep(REQUEST_DELAY)
             
             html = self.driver.page_source
@@ -243,32 +293,40 @@ class FBRefSeasonScraper:
             with open(html_dir / f"{match_id}.html", "w", encoding="utf-8") as f:
                 f.write(html)
             
-            # Parse tables
-            tables = pd.read_html(StringIO(html))
+            # Parse tables by ID (robust across different browser configurations)
+            team_tables = extract_tables_by_id(html)
             
-            if len(tables) < 12:
-                print(f"    [WARN] Only found {len(tables)} tables, expected 12+")
+            if len(team_tables) < 2:
+                print(f"    [WARN] Only found {len(team_tables)} teams, expected 2")
+                # Fallback to old index-based method
+                tables = pd.read_html(StringIO(html))
+                print(f"    [INFO] Fallback: found {len(tables)} total tables")
                 return False
             
             # Create output directory structure
             match_dir = DATA_DIR / season / f"gw{gw}" / f"{clean_team_name(home)}_vs_{clean_team_name(away)}"
             
-            # Save home team tables
+            # Get team IDs (first team is home, second is away based on page order)
+            team_ids = list(team_tables.keys())
+            
+            # Save home team tables (first team in the dict)
             home_dir = match_dir / clean_team_name(home)
             home_dir.mkdir(parents=True, exist_ok=True)
             
-            for stat_type, idx in TABLE_MAPPING["home"].items():
-                if idx < len(tables):
-                    df = clean_columns(tables[idx].copy())
+            home_team_id = team_ids[0]
+            for stat_type in STAT_TYPES:
+                if stat_type in team_tables[home_team_id]:
+                    df = clean_columns(team_tables[home_team_id][stat_type].copy())
                     df.to_csv(home_dir / f"{stat_type}.csv", index=False)
             
-            # Save away team tables
+            # Save away team tables (second team in the dict)
             away_dir = match_dir / clean_team_name(away)
             away_dir.mkdir(parents=True, exist_ok=True)
             
-            for stat_type, idx in TABLE_MAPPING["away"].items():
-                if idx < len(tables):
-                    df = clean_columns(tables[idx].copy())
+            away_team_id = team_ids[1]
+            for stat_type in STAT_TYPES:
+                if stat_type in team_tables[away_team_id]:
+                    df = clean_columns(team_tables[away_team_id][stat_type].copy())
                     df.to_csv(away_dir / f"{stat_type}.csv", index=False)
             
             # Mark as scraped
@@ -374,4 +432,3 @@ if __name__ == "__main__":
     else:
         # Full scrape
         scraper.scrape_all_seasons(args.seasons)
-

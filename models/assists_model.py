@@ -37,6 +37,14 @@ class AssistsModel:
         'gca_per90_roll5',
         'key_passes_per90_roll5',
         
+        # LIFETIME PLAYER PROFILE (career-long stats)
+        'lifetime_assists_per90',       # Career assists per 90 mins
+        'lifetime_xag_per90',           # Career xAG per 90 mins
+        'lifetime_key_passes_per90',    # Career key passes per 90 mins
+        'lifetime_sca_per90',           # Career shot-creating actions per 90
+        'lifetime_gca_per90',           # Career goal-creating actions per 90
+        'lifetime_minutes',             # Total career minutes (experience indicator)
+        
         # Recent form
         'assists_last1',
         'assists_roll3',

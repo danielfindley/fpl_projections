@@ -37,7 +37,9 @@ PROJECT_DIR = SCRIPT_DIR.parent
 DATA_DIR = PROJECT_DIR / "data"
 
 # Timing - be nice to FBRef
-INITIAL_PAGE_DELAY = 5  # Wait for CloudFlare verification
+INITIAL_PAGE_DELAY = 10  # Initial wait after page load
+CAPTCHA_TIMEOUT = 120  # Maximum seconds to wait for captcha/CloudFlare
+CAPTCHA_CHECK_INTERVAL = 3  # Seconds between checks for page load
 REQUEST_DELAY = 4  # Seconds between match report requests
 
 # FBRef URLs
@@ -65,6 +67,70 @@ def get_driver():
 # SCRAPING FUNCTIONS
 # =============================================================================
 
+def wait_for_page_load(driver, check_text: str = None, check_element: str = None, 
+                        timeout: int = CAPTCHA_TIMEOUT) -> bool:
+    """
+    Wait for page to fully load, handling CloudFlare captcha/verification.
+    
+    Args:
+        driver: Selenium WebDriver instance
+        check_text: Text that should be present when page is loaded (optional)
+        check_element: Element ID/class that should be present (optional)
+        timeout: Maximum seconds to wait
+    
+    Returns:
+        True if page loaded successfully, False if timeout
+    """
+    start_time = time.time()
+    attempt = 0
+    
+    print(f"  [*] Waiting for page to load (captcha timeout: {timeout}s)...")
+    
+    while time.time() - start_time < timeout:
+        attempt += 1
+        html = driver.page_source
+        
+        # Check for CloudFlare/captcha indicators
+        cloudflare_indicators = [
+            "Just a moment",
+            "Checking your browser",
+            "Enable JavaScript and cookies",
+            "Verifying you are human",
+            "cf-browser-verification",
+            "challenge-running"
+        ]
+        
+        is_cloudflare = any(indicator in html for indicator in cloudflare_indicators)
+        
+        if is_cloudflare:
+            elapsed = int(time.time() - start_time)
+            print(f"    [Attempt {attempt}] CloudFlare captcha detected, waiting... ({elapsed}s elapsed)")
+            time.sleep(CAPTCHA_CHECK_INTERVAL)
+            continue
+        
+        # Check if page has actual content
+        if len(html) < 10000:
+            elapsed = int(time.time() - start_time)
+            print(f"    [Attempt {attempt}] Page too small ({len(html)} bytes), waiting... ({elapsed}s elapsed)")
+            time.sleep(CAPTCHA_CHECK_INTERVAL)
+            continue
+        
+        # Optional: check for specific text
+        if check_text and check_text not in html:
+            elapsed = int(time.time() - start_time)
+            print(f"    [Attempt {attempt}] Expected content not found, waiting... ({elapsed}s elapsed)")
+            time.sleep(CAPTCHA_CHECK_INTERVAL)
+            continue
+        
+        # Success - page loaded!
+        elapsed = int(time.time() - start_time)
+        print(f"  [✓] Page loaded successfully after {elapsed}s")
+        return True
+    
+    print(f"  [✗] Timeout after {timeout}s - page did not load")
+    return False
+
+
 def scrape_fixtures(driver, gameweek: int, season: str) -> list:
     """
     Scrape fixtures to get match report URLs for a specific gameweek.
@@ -83,6 +149,12 @@ def scrape_fixtures(driver, gameweek: int, season: str) -> list:
     
     driver.get(FIXTURES_URL)
     time.sleep(INITIAL_PAGE_DELAY)
+    
+    # Wait for captcha/CloudFlare to complete - look for "Premier League" text
+    if not wait_for_page_load(driver, check_text="Premier League"):
+        print("⚠️ Failed to load fixtures page - captcha may have timed out")
+        print("   Please try running again - you may need to solve the captcha manually")
+        return []
     
     html = driver.page_source
     soup = BeautifulSoup(html, 'lxml')
@@ -173,13 +245,17 @@ def scrape_match_reports(driver, fixtures: list, gameweek: int, season: str) -> 
             driver.get(url)
             time.sleep(REQUEST_DELAY)
             
-            html = driver.page_source
+            # Wait for page to load with proper captcha handling
+            # Use shorter timeout for individual matches (they usually load faster after first page)
+            if not wait_for_page_load(driver, check_text="Match Report", timeout=60):
+                print(f"    ⚠️ Failed to load match page after waiting - trying one more time...")
+                driver.refresh()
+                time.sleep(REQUEST_DELAY)
+                if not wait_for_page_load(driver, timeout=60):
+                    print(f"    ✗ Could not load match page, skipping")
+                    continue
             
-            # Verify we got actual content (not CloudFlare page)
-            if "Just a moment" in html or len(html) < 10000:
-                print(f"    ⚠️ Got CloudFlare page, waiting longer...")
-                time.sleep(5)
-                html = driver.page_source
+            html = driver.page_source
             
             with open(save_path, "w", encoding="utf-8") as f:
                 f.write(html)

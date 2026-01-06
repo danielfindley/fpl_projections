@@ -32,6 +32,15 @@ class DefconModel:
         'blocks_per90_roll5',
         'recoveries_per90_roll5',
         
+        # LIFETIME PLAYER PROFILE (career-long defensive stats)
+        'lifetime_defcon_per90',        # Career defcon per 90 mins
+        'lifetime_tackles_per90',       # Career tackles per 90 mins
+        'lifetime_interceptions_per90', # Career interceptions per 90 mins
+        'lifetime_clearances_per90',    # Career clearances per 90 mins
+        'lifetime_blocks_per90',        # Career blocks per 90 mins
+        'lifetime_recoveries_per90',    # Career recoveries per 90 mins
+        'lifetime_minutes',             # Total career minutes (experience indicator)
+        
         # Recent form
         'defcon_last1',
         'defcon_roll3',

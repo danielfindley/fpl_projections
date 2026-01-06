@@ -9,6 +9,7 @@ Supports two modes:
 - Tune mode: Evaluate models using train/test split or cross-validation
 """
 
+import gc
 import pandas as pd
 import numpy as np
 import json
@@ -18,9 +19,10 @@ import warnings
 from pathlib import Path
 from typing import Tuple, Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field
-from sklearn.model_selection import train_test_split, KFold
+from sklearn.model_selection import train_test_split, KFold, RandomizedSearchCV
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.feature_selection import RFE, SelectFromModel
+from scipy.stats import uniform, randint, loguniform
 
 warnings.filterwarnings('ignore')
 
@@ -42,6 +44,7 @@ from models.assists_model import AssistsModel
 from models.defcon_model import DefconModel
 from models.clean_sheet_model import CleanSheetModel
 from models.bonus_model_mc import BonusModelMC as BonusModel
+from scripts.fpl_api_status import get_fpl_player_status, merge_fpl_status
 
 
 # ============================================================================
@@ -59,9 +62,13 @@ class TuneConfig:
         random_state: Random seed for reproducibility
         hyperparams: Dict of model_name -> dict of hyperparameters to override
         feature_selection: Feature selection method ('none', 'importance', 'rfe')
-        feature_selection_k: Number of top features to keep (for 'importance' and 'rfe')
+        feature_selection_k: Number of top features to keep (for 'importance' and 'rfe') - used when Optuna is disabled
+        feature_selection_k_min: Minimum features to try when tuning with Optuna (default 5)
+        feature_selection_k_max: Maximum features to try when tuning with Optuna (default 30)
+        tune_feature_count: Whether to include feature count as an Optuna hyperparameter (default True when optuna_trials > 0)
         optuna_trials: Number of Optuna trials for hyperparameter optimization (0 to disable)
         optuna_timeout: Timeout in seconds for Optuna optimization (None for no timeout)
+        low_memory_mode: Enable aggressive memory optimizations for systems with limited RAM
     """
     models: List[str] = field(default_factory=lambda: ['goals', 'assists', 'minutes', 'defcon'])
     test_size: float = 0.2
@@ -71,11 +78,16 @@ class TuneConfig:
     
     # Feature selection options
     feature_selection: str = 'none'  # 'none', 'importance', 'rfe'
-    feature_selection_k: int = 20  # Number of features to keep
+    feature_selection_k: int = 20  # Number of features to keep (used when Optuna disabled)
+    feature_selection_k_min: int = 5  # Min features when tuning with Optuna
+    feature_selection_k_max: int = 30  # Max features when tuning with Optuna
+    tune_feature_count: bool = True  # Whether to tune feature count with Optuna
     
-    # Optuna hyperparameter optimization
-    optuna_trials: int = 0  # Number of trials (0 = disabled)
+    # Hyperparameter optimization
+    optuna_trials: int = 0  # Number of Optuna trials (0 = disabled) - DEPRECATED, use random_search_iter
     optuna_timeout: Optional[int] = None  # Timeout in seconds
+    random_search_iter: int = 0  # Number of RandomizedSearchCV iterations (0 = disabled, recommended: 100)
+    
     
     # Default hyperparameters for each model type
     @staticmethod
@@ -154,6 +166,50 @@ class TuneConfig:
                 'max_depth': ('int', 3, 8),
                 'learning_rate': ('float_log', 0.01, 0.3),
                 'min_child_weight': ('int', 1, 10),
+            },
+        }
+    
+    # RandomizedSearchCV search spaces (using scipy distributions)
+    @staticmethod
+    def random_search_space() -> Dict[str, Dict[str, Any]]:
+        """Define the search space for RandomizedSearchCV optimization."""
+        return {
+            'goals': {
+                'n_estimators': randint(100, 500),
+                'max_depth': randint(3, 11),
+                'learning_rate': loguniform(0.01, 0.3),
+                'min_child_weight': randint(1, 11),
+                'subsample': uniform(0.6, 0.4),  # uniform(loc, scale) = [loc, loc+scale]
+                'colsample_bytree': uniform(0.6, 0.4),
+                'reg_alpha': loguniform(1e-8, 10.0),
+                'reg_lambda': loguniform(1e-8, 10.0),
+            },
+            'assists': {
+                'n_estimators': randint(100, 500),
+                'max_depth': randint(3, 11),
+                'learning_rate': loguniform(0.01, 0.3),
+                'min_child_weight': randint(1, 11),
+                'subsample': uniform(0.6, 0.4),
+                'colsample_bytree': uniform(0.6, 0.4),
+            },
+            'minutes': {
+                'n_estimators': randint(100, 500),
+                'max_depth': randint(3, 9),
+                'learning_rate': loguniform(0.01, 0.3),
+                'min_child_weight': randint(1, 16),
+                'subsample': uniform(0.6, 0.4),
+            },
+            'defcon': {
+                'n_estimators': randint(100, 500),
+                'max_depth': randint(3, 11),
+                'learning_rate': loguniform(0.01, 0.3),
+                'min_child_weight': randint(1, 11),
+            },
+            'bonus': {
+                'n_estimators': randint(50, 300),
+                'max_depth': randint(3, 9),
+                'learning_rate': loguniform(0.01, 0.3),
+                'min_child_weight': randint(1, 11),
             },
         }
     
@@ -311,6 +367,7 @@ def fetch_fpl_positions(data_dir: Path, player_names: set, verbose: bool = True)
         'Raúl Jiménez': 'FWD',
         'Matheus Cunha': 'MID',
         'Mateus Gonçalo Espanha Fernandes': 'MID',
+        'Savio': 'MID',
     }
     
     # Apply manual overrides
@@ -387,7 +444,8 @@ def load_raw_data(data_dir: Path, verbose: bool = True) -> pd.DataFrame:
                         
                         col_map = {'Gls': 'goals', 'Ast': 'assists', 'xG': 'xg', 'npxG': 'npxg',
                                    'xAG': 'xag', 'Sh': 'shots', 'SoT': 'shots_on_target',
-                                   'SCA': 'sca', 'GCA': 'gca'}
+                                   'SCA': 'sca', 'GCA': 'gca',
+                                   'CrdY': 'yellow_cards', 'CrdR': 'red_cards'}
                         for orig_col, new_col in col_map.items():
                             if orig_col in summary.columns:
                                 players[new_col] = pd.to_numeric(summary[orig_col], errors='coerce').fillna(0)
@@ -424,7 +482,7 @@ def load_raw_data(data_dir: Path, verbose: bool = True) -> pd.DataFrame:
                                     passing_cols['ppa'] = pd.to_numeric(passing['PPA'], errors='coerce').fillna(0)
                                 players = players.merge(passing_cols, on='Player', how='left')
                         
-                        for col in ['tackles', 'interceptions', 'clearances', 'blocks', 'recoveries', 'xa', 'key_passes', 'ppa']:
+                        for col in ['tackles', 'interceptions', 'clearances', 'blocks', 'recoveries', 'xa', 'key_passes', 'ppa', 'yellow_cards', 'red_cards']:
                             if col in players.columns:
                                 players[col] = players[col].fillna(0)
                             else:
@@ -560,6 +618,28 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
             df[f'{col}_per90'] = df[col] / np.maximum(df['minutes'] / 90, 0.01)
             df[f'{col}_per90_roll5'] = df.groupby('player_id')[f'{col}_per90'].transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean())
     
+    # Yellow/Red card rolling features (for bonus model - cards reduce BPS)
+    if 'yellow_cards' in df.columns:
+        df['yellow_cards_roll5'] = df.groupby('player_id')['yellow_cards'].transform(
+            lambda x: x.shift(1).rolling(5, min_periods=1).sum()
+        ).fillna(0)
+        df['yellow_cards_roll10'] = df.groupby('player_id')['yellow_cards'].transform(
+            lambda x: x.shift(1).rolling(10, min_periods=1).sum()
+        ).fillna(0)
+        # Card rate per game (useful for BPS penalty prediction)
+        df['yellow_card_rate'] = df['yellow_cards_roll10'] / 10
+    else:
+        df['yellow_cards_roll5'] = 0
+        df['yellow_cards_roll10'] = 0
+        df['yellow_card_rate'] = 0
+    
+    if 'red_cards' in df.columns:
+        df['red_cards_roll20'] = df.groupby('player_id')['red_cards'].transform(
+            lambda x: x.shift(1).rolling(20, min_periods=1).sum()
+        ).fillna(0)
+    else:
+        df['red_cards_roll20'] = 0
+    
     # Team rolling features
     team_stats = df.groupby(['team', 'season', 'gameweek']).agg({'goals': 'sum', 'xg': 'sum', 'shots': 'sum'}).reset_index()
     team_stats = team_stats.rename(columns={'goals': 'team_goals', 'xg': 'team_xg', 'shots': 'team_shots'})
@@ -607,13 +687,164 @@ def compute_rolling_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataF
     
     df['is_home'] = df['is_home'].astype(int)
     
+    # ========================================================================
+    # LIFETIME PLAYER PROFILE FEATURES
+    # These capture a player's entire career history in the Premier League
+    # ========================================================================
+    if verbose:
+        print('  Computing lifetime player profile features...')
+    
+    # Sort by player and chronological order (across all seasons)
+    df = df.sort_values(['player_name', 'season', 'gameweek']).reset_index(drop=True)
+    
+    # Compute cumulative stats across a player's ENTIRE career (shifted to avoid leakage)
+    # We use player_name instead of player_id to track players across teams
+    for stat in ['goals', 'assists', 'xg', 'xag', 'minutes', 'shots', 'sca', 'gca', 'key_passes']:
+        if stat in df.columns:
+            # Cumulative sum of stat (shifted by 1 to avoid leakage)
+            df[f'lifetime_{stat}'] = df.groupby('player_name')[stat].transform(
+                lambda x: x.shift(1).expanding().sum()
+            )
+    
+    # Compute cumulative minutes for per-90 calculations
+    df['lifetime_minutes'] = df.groupby('player_name')['minutes'].transform(
+        lambda x: x.shift(1).expanding().sum()
+    )
+    
+    # Compute lifetime per-90 rates (with minimum minutes threshold)
+    min_minutes_threshold = 90  # Need at least 90 minutes of history
+    lifetime_mins_90 = np.maximum(df['lifetime_minutes'] / 90, 0.01)
+    
+    # Goals per 90 (lifetime)
+    if 'lifetime_goals' in df.columns:
+        df['lifetime_goals_per90'] = np.where(
+            df['lifetime_minutes'] >= min_minutes_threshold,
+            df['lifetime_goals'] / lifetime_mins_90,
+            0  # Default to 0 if insufficient minutes
+        )
+    
+    # Assists per 90 (lifetime)
+    if 'lifetime_assists' in df.columns:
+        df['lifetime_assists_per90'] = np.where(
+            df['lifetime_minutes'] >= min_minutes_threshold,
+            df['lifetime_assists'] / lifetime_mins_90,
+            0
+        )
+    
+    # xG per 90 (lifetime)
+    if 'lifetime_xg' in df.columns:
+        df['lifetime_xg_per90'] = np.where(
+            df['lifetime_minutes'] >= min_minutes_threshold,
+            df['lifetime_xg'] / lifetime_mins_90,
+            0
+        )
+    
+    # xAG per 90 (lifetime)
+    if 'lifetime_xag' in df.columns:
+        df['lifetime_xag_per90'] = np.where(
+            df['lifetime_minutes'] >= min_minutes_threshold,
+            df['lifetime_xag'] / lifetime_mins_90,
+            0
+        )
+    
+    # Shots per 90 (lifetime)
+    if 'lifetime_shots' in df.columns:
+        df['lifetime_shots_per90'] = np.where(
+            df['lifetime_minutes'] >= min_minutes_threshold,
+            df['lifetime_shots'] / lifetime_mins_90,
+            0
+        )
+    
+    # SCA per 90 (lifetime)
+    if 'lifetime_sca' in df.columns:
+        df['lifetime_sca_per90'] = np.where(
+            df['lifetime_minutes'] >= min_minutes_threshold,
+            df['lifetime_sca'] / lifetime_mins_90,
+            0
+        )
+    
+    # GCA per 90 (lifetime)
+    if 'lifetime_gca' in df.columns:
+        df['lifetime_gca_per90'] = np.where(
+            df['lifetime_minutes'] >= min_minutes_threshold,
+            df['lifetime_gca'] / lifetime_mins_90,
+            0
+        )
+    
+    # Key passes per 90 (lifetime)
+    if 'lifetime_key_passes' in df.columns:
+        df['lifetime_key_passes_per90'] = np.where(
+            df['lifetime_minutes'] >= min_minutes_threshold,
+            df['lifetime_key_passes'] / lifetime_mins_90,
+            0
+        )
+    
+    # Goal involvements per 90 (lifetime)
+    if 'lifetime_goals' in df.columns and 'lifetime_assists' in df.columns:
+        df['lifetime_goal_involvements'] = df['lifetime_goals'].fillna(0) + df['lifetime_assists'].fillna(0)
+        df['lifetime_goal_involvements_per90'] = np.where(
+            df['lifetime_minutes'] >= min_minutes_threshold,
+            df['lifetime_goal_involvements'] / lifetime_mins_90,
+            0
+        )
+    
+    # Lifetime defcon stats (for defenders/midfielders)
+    for stat in ['tackles', 'interceptions', 'clearances', 'blocks', 'recoveries']:
+        if stat in df.columns:
+            df[f'lifetime_{stat}'] = df.groupby('player_name')[stat].transform(
+                lambda x: x.shift(1).expanding().sum()
+            )
+            df[f'lifetime_{stat}_per90'] = np.where(
+                df['lifetime_minutes'] >= min_minutes_threshold,
+                df[f'lifetime_{stat}'] / lifetime_mins_90,
+                0
+            )
+    
+    # Lifetime CBIT and CBIRT
+    if all(col in df.columns for col in ['lifetime_tackles', 'lifetime_interceptions', 'lifetime_clearances', 'lifetime_blocks']):
+        df['lifetime_CBIT'] = (df['lifetime_clearances'].fillna(0) + df['lifetime_blocks'].fillna(0) + 
+                               df['lifetime_interceptions'].fillna(0) + df['lifetime_tackles'].fillna(0))
+        df['lifetime_CBIT_per90'] = np.where(
+            df['lifetime_minutes'] >= min_minutes_threshold,
+            df['lifetime_CBIT'] / lifetime_mins_90,
+            0
+        )
+        
+        if 'lifetime_recoveries' in df.columns:
+            df['lifetime_CBIRT'] = df['lifetime_CBIT'] + df['lifetime_recoveries'].fillna(0)
+            df['lifetime_CBIRT_per90'] = np.where(
+                df['lifetime_minutes'] >= min_minutes_threshold,
+                df['lifetime_CBIRT'] / lifetime_mins_90,
+                0
+            )
+    
+    # Lifetime defcon per 90 (position-specific)
+    if 'lifetime_CBIT_per90' in df.columns and 'lifetime_CBIRT_per90' in df.columns:
+        df['lifetime_defcon_per90'] = np.where(
+            df['is_defender'] == 1,
+            df['lifetime_CBIT_per90'],
+            df['lifetime_CBIRT_per90']
+        )
+    
+    # Lifetime minutes per appearance (consistency indicator)
+    df['lifetime_appearances'] = df.groupby('player_name').cumcount()
+    df['lifetime_minutes_per_appearance'] = np.where(
+        df['lifetime_appearances'] > 0,
+        df['lifetime_minutes'] / df['lifetime_appearances'],
+        0
+    )
+    
+    if verbose:
+        lifetime_cols = [c for c in df.columns if 'lifetime' in c]
+        print(f'    Added {len(lifetime_cols)} lifetime player profile features')
+    
     # Fill NaN
-    rolling_cols = [c for c in df.columns if 'roll' in c or 'last1' in c or 'per90' in c]
+    rolling_cols = [c for c in df.columns if 'roll' in c or 'last1' in c or 'per90' in c or 'lifetime' in c]
     for col in rolling_cols:
         df[col] = df[col].fillna(0)
     
     if verbose:
-        print(f'  Computed {len(rolling_cols)} rolling features')
+        print(f'  Computed {len(rolling_cols)} rolling + lifetime features')
     
     return df
 
@@ -720,6 +951,38 @@ class FPLPredictionPipeline:
         self.train_df = None
         self.test_df = None
         self.tune_results: Dict[str, ModelMetrics] = {}
+        self._tuned_params_cache: Dict[str, Dict] = {}  # Cache for loaded tuned params
+    
+    def load_tuned_params(self, model_name: str) -> Tuple[Dict[str, Any], Optional[List[str]]]:
+        """
+        Load tuned parameters from JSON file for a model.
+        
+        Args:
+            model_name: Name of model (goals, assists, minutes, defcon, clean_sheet, bonus)
+            
+        Returns:
+            Tuple of (best_params dict, selected_features list or None)
+        """
+        # Check cache first
+        if model_name in self._tuned_params_cache:
+            cached = self._tuned_params_cache[model_name]
+            return cached.get('best_params', {}), cached.get('selected_features')
+        
+        # Try to load from JSON file
+        tuning_results_dir = self.data_dir / 'tuning_results'
+        json_file = tuning_results_dir / f'{model_name}_tuned.json'
+        
+        if json_file.exists():
+            try:
+                import json
+                with open(json_file, 'r') as f:
+                    data = json.load(f)
+                self._tuned_params_cache[model_name] = data
+                return data.get('best_params', {}), data.get('selected_features')
+            except Exception as e:
+                print(f"  Warning: Could not load tuned params for {model_name}: {e}")
+        
+        return {}, None
     
     def tune(self, config: TuneConfig = None, verbose: bool = True) -> Dict[str, ModelMetrics]:
         """
@@ -785,6 +1048,9 @@ class FPLPredictionPipeline:
             results[model_name] = metrics
             if verbose:
                 print(metrics)
+            
+            # Force garbage collection between models to free memory
+            gc.collect()
         
         self.tune_results = results
         
@@ -802,9 +1068,11 @@ class FPLPredictionPipeline:
         """Tune and evaluate the goals model."""
         params = config.get_hyperparams('goals')
         
-        # Optuna optimization if enabled
+        # Hyperparameter optimization
         study = None
-        if config.optuna_trials > 0:
+        if config.random_search_iter > 0:
+            params = self._random_search_optimize('goals', GoalsModel, df, config, verbose)
+        elif config.optuna_trials > 0:
             params, study = self._optuna_optimize('goals', GoalsModel, df, config, verbose)
         
         if config.cv_folds:
@@ -816,9 +1084,11 @@ class FPLPredictionPipeline:
         """Tune and evaluate the assists model."""
         params = config.get_hyperparams('assists')
         
-        # Optuna optimization if enabled
+        # Hyperparameter optimization
         study = None
-        if config.optuna_trials > 0:
+        if config.random_search_iter > 0:
+            params = self._random_search_optimize('assists', AssistsModel, df, config, verbose)
+        elif config.optuna_trials > 0:
             params, study = self._optuna_optimize('assists', AssistsModel, df, config, verbose)
         
         if config.cv_folds:
@@ -830,9 +1100,11 @@ class FPLPredictionPipeline:
         """Tune and evaluate the minutes model."""
         params = config.get_hyperparams('minutes')
         
-        # Optuna optimization if enabled
+        # Hyperparameter optimization
         study = None
-        if config.optuna_trials > 0:
+        if config.random_search_iter > 0:
+            params = self._random_search_optimize('minutes', MinutesModel, df, config, verbose)
+        elif config.optuna_trials > 0:
             params, study = self._optuna_optimize('minutes', MinutesModel, df, config, verbose)
         
         if config.cv_folds:
@@ -844,9 +1116,11 @@ class FPLPredictionPipeline:
         """Tune and evaluate the defcon model."""
         params = config.get_hyperparams('defcon')
         
-        # Optuna optimization if enabled
+        # Hyperparameter optimization
         study = None
-        if config.optuna_trials > 0:
+        if config.random_search_iter > 0:
+            params = self._random_search_optimize('defcon', DefconModel, df, config, verbose)
+        elif config.optuna_trials > 0:
             params, study = self._optuna_optimize('defcon', DefconModel, df, config, verbose)
         
         if config.cv_folds:
@@ -855,7 +1129,9 @@ class FPLPredictionPipeline:
             return self._split_evaluate_model('defcon', DefconModel, df, config, params, study, verbose)
     
     def _tune_clean_sheet_model(self, config: TuneConfig, verbose: bool) -> ModelMetrics:
-        """Tune and evaluate the clean sheet model."""
+        """Tune and evaluate the clean sheet model with Optuna hyperparameter optimization and feature selection."""
+        from sklearn.metrics import roc_auc_score, brier_score_loss
+        
         # CS model uses team-level features, different from player models
         cs_model = CleanSheetModel()
         team_features = cs_model.prepare_features(self.df)
@@ -865,14 +1141,146 @@ class FPLPredictionPipeline:
             team_features, test_size=config.test_size, random_state=config.random_state
         )
         
-        cs_model.fit(train_teams, verbose=False)
+        # Pre-compute validation target
+        y_test = test_teams['clean_sheet'].values
+        
+        # Get original features and setup feature selection
+        original_features = cs_model.FEATURES.copy()
+        max_features = min(config.feature_selection_k_max, len(original_features))
+        min_features = max(config.feature_selection_k_min, 3)  # At least 3 features
+        
+        # Check if we should tune feature count
+        tune_n_features = (
+            config.tune_feature_count and 
+            config.feature_selection != 'none' and
+            config.feature_selection_k_min < config.feature_selection_k_max
+        )
+        
+        # Cache for feature selection results
+        feature_selection_cache = {}
+        
+        def get_selected_features_cs(n_features: int) -> List[str]:
+            """Get selected features for clean sheet model using importance-based selection."""
+            if n_features in feature_selection_cache:
+                return feature_selection_cache[n_features]
+            
+            # Train a model with default params to get feature importances
+            temp_model = CleanSheetModel(random_state=config.random_state)
+            temp_model.team_encoder = cs_model.team_encoder
+            temp_model.fit(train_teams, verbose=False)
+            
+            # Get feature importance and select top k
+            fi = temp_model.feature_importance()
+            selected = fi.head(n_features)['feature'].tolist()
+            
+            feature_selection_cache[n_features] = selected
+            return selected
+        
+        best_params = {}
+        best_n_features = None
+        selected_features = None
+        study = None
+        
+        # Run Optuna optimization if enabled
+        if config.optuna_trials > 0 and OPTUNA_AVAILABLE:
+            if verbose:
+                print(f"  Running Optuna optimization ({config.optuna_trials} trials)...")
+                if tune_n_features:
+                    print(f"  Feature selection enabled: {min_features}-{max_features} features")
+            
+            # Search space for XGBoost classifier
+            search_space = {
+                'n_estimators': ('int', 50, 300),
+                'max_depth': ('int', 3, 10),
+                'learning_rate': ('float_log', 0.01, 0.3),
+                'min_child_weight': ('int', 1, 10),
+                'subsample': ('float', 0.6, 1.0),
+                'colsample_bytree': ('float', 0.6, 1.0),
+            }
+            
+            def objective(trial):
+                params = {'random_state': config.random_state, 'eval_metric': 'logloss'}
+                
+                for param_name, param_config in search_space.items():
+                    param_type = param_config[0]
+                    if param_type == 'int':
+                        params[param_name] = trial.suggest_int(param_name, param_config[1], param_config[2])
+                    elif param_type == 'float':
+                        params[param_name] = trial.suggest_float(param_name, param_config[1], param_config[2])
+                    elif param_type == 'float_log':
+                        params[param_name] = trial.suggest_float(param_name, param_config[1], param_config[2], log=True)
+                
+                # Sample number of features if tuning
+                if tune_n_features:
+                    n_features = trial.suggest_int('n_features', min_features, max_features)
+                    trial_features = get_selected_features_cs(n_features)
+                    
+                    # Create model with selected features
+                    class TempCSModel(CleanSheetModel):
+                        FEATURES = trial_features
+                    
+                    trial_model = TempCSModel(**params)
+                else:
+                    trial_model = CleanSheetModel(**params)
+                
+                trial_model.team_encoder = cs_model.team_encoder  # Reuse encoder
+                trial_model.fit(train_teams, verbose=False)
+                
+                # Evaluate using Brier score (lower is better)
+                y_pred = trial_model.predict_proba(test_teams)
+                brier = brier_score_loss(y_test, y_pred)
+                
+                return brier
+            
+            # Create and run study
+            sampler = TPESampler(seed=config.random_state)
+            study = optuna.create_study(direction='minimize', sampler=sampler)
+            
+            # Suppress Optuna logs unless verbose
+            optuna.logging.set_verbosity(optuna.logging.WARNING if not verbose else optuna.logging.INFO)
+            
+            study.optimize(
+                objective,
+                n_trials=config.optuna_trials,
+                timeout=config.optuna_timeout,
+                show_progress_bar=verbose,
+                gc_after_trial=True,
+            )
+            
+            best_params = study.best_params.copy()
+            
+            # Extract n_features from best params if tuned
+            best_n_features = best_params.pop('n_features', None)
+            best_params['random_state'] = config.random_state
+            best_params['eval_metric'] = 'logloss'
+            
+            # Get selected features if feature selection was used
+            if best_n_features is not None:
+                selected_features = get_selected_features_cs(best_n_features)
+            
+            if verbose:
+                print(f"  Best Brier Score: {study.best_value:.4f}")
+                print(f"  Best params: {best_params}")
+                if best_n_features is not None:
+                    print(f"  Best n_features: {best_n_features}")
+            
+            # Clean up cache
+            feature_selection_cache.clear()
+            gc.collect()
+        
+        # Train final model with best params and selected features
+        if selected_features:
+            class FinalCSModel(CleanSheetModel):
+                FEATURES = selected_features
+            final_model = FinalCSModel(**best_params) if best_params else FinalCSModel()
+        else:
+            final_model = CleanSheetModel(**best_params) if best_params else CleanSheetModel()
+        
+        final_model.team_encoder = cs_model.team_encoder  # Reuse encoder
+        final_model.fit(train_teams, verbose=False)
         
         # Evaluate
-        y_test = test_teams['clean_sheet'].values
-        y_pred = cs_model.predict_proba(test_teams)
-        
-        # For classification, use different metrics
-        from sklearn.metrics import roc_auc_score, brier_score_loss
+        y_pred = final_model.predict_proba(test_teams)
         auc = roc_auc_score(y_test, y_pred)
         brier = brier_score_loss(y_test, y_pred)
         
@@ -881,8 +1289,10 @@ class FPLPredictionPipeline:
             print(f"  Test samples: {len(test_teams):,}")
             print(f"  AUC-ROC: {auc:.4f}")
             print(f"  Brier Score: {brier:.4f}")
+            if selected_features:
+                print(f"  Selected features ({len(selected_features)}): {selected_features[:5]}...")
         
-        self.models['clean_sheet'] = cs_model
+        self.models['clean_sheet'] = final_model
         
         return ModelMetrics(
             model_name='clean_sheet',
@@ -890,7 +1300,9 @@ class FPLPredictionPipeline:
             rmse=np.sqrt(brier),
             r2=auc,  # Use AUC as R² analog
             samples=len(test_teams),
-            feature_importance=cs_model.feature_importance() if hasattr(cs_model, 'feature_importance') else None
+            feature_importance=final_model.feature_importance() if hasattr(final_model, 'feature_importance') else None,
+            selected_features=selected_features,  # Now includes selected features!
+            best_params=best_params if best_params else None,
         )
     
     def _split_evaluate_model(self, name: str, model_class, df: pd.DataFrame, 
@@ -916,16 +1328,23 @@ class FPLPredictionPipeline:
             temp_model = model_class(**params)
             original_features = temp_model.FEATURES.copy()
             
+            # Determine number of features to use:
+            # - If Optuna found best n_features, use that
+            # - Otherwise use config.feature_selection_k
+            n_features_to_select = config.feature_selection_k
+            if study is not None and hasattr(study, 'best_n_features') and study.best_n_features is not None:
+                n_features_to_select = study.best_n_features
+            
             if config.feature_selection == 'importance':
                 selected_features = self._select_features_importance(
                     model_class, train_df, original_features,
-                    temp_model.TARGET, config.feature_selection_k, params, verbose
+                    temp_model.TARGET, n_features_to_select, params, verbose
                 )
             elif config.feature_selection == 'rfe':
                 target_col = temp_model.TARGET
                 selected_features = self._select_features_rfe(
                     train_df, original_features, target_col, 
-                    config.feature_selection_k, verbose
+                    n_features_to_select, verbose
                 )
             
             # Update model class to use selected features
@@ -1001,16 +1420,23 @@ class FPLPredictionPipeline:
             temp_model = model_class(**params)
             original_features = temp_model.FEATURES.copy()
             
+            # Determine number of features to use:
+            # - If Optuna found best n_features, use that
+            # - Otherwise use config.feature_selection_k
+            n_features_to_select = config.feature_selection_k
+            if study is not None and hasattr(study, 'best_n_features') and study.best_n_features is not None:
+                n_features_to_select = study.best_n_features
+            
             if config.feature_selection == 'importance':
                 selected_features = self._select_features_importance(
                     model_class, df, original_features,
-                    temp_model.TARGET, config.feature_selection_k, params, verbose
+                    temp_model.TARGET, n_features_to_select, params, verbose
                 )
             elif config.feature_selection == 'rfe':
                 target_col = temp_model.TARGET
                 selected_features = self._select_features_rfe(
                     df, original_features, target_col, 
-                    config.feature_selection_k, verbose
+                    n_features_to_select, verbose
                 )
             
             if selected_features:
@@ -1132,12 +1558,87 @@ class FPLPredictionPipeline:
         return selected_features
     
     # =========================================================================
+    # RANDOMIZED SEARCH HYPERPARAMETER OPTIMIZATION
+    # =========================================================================
+    
+    def _random_search_optimize(self, name: str, model_class, df: pd.DataFrame,
+                                 config: TuneConfig, verbose: bool) -> Dict[str, Any]:
+        """Run RandomizedSearchCV hyperparameter optimization.
+        
+        This is more memory-efficient than Optuna and works reliably for large numbers
+        of iterations without memory accumulation issues.
+        """
+        from xgboost import XGBRegressor
+        
+        if verbose:
+            print(f"  Running RandomizedSearchCV ({config.random_search_iter} iterations)...")
+        
+        # Get search space
+        param_distributions = config.random_search_space().get(name, {})
+        
+        # Prepare data
+        temp_model = model_class()
+        features = temp_model.FEATURES
+        target_col = temp_model.TARGET
+        del temp_model
+        
+        available_features = [f for f in features if f in df.columns]
+        X = df[available_features].fillna(0)
+        
+        # Get target
+        if name == 'minutes':
+            y = df['minutes'].values
+        elif name == 'bonus':
+            y = df['bonus'].values
+        else:
+            if target_col in df.columns:
+                y = df[target_col].values
+            else:
+                y = (df[name] / np.maximum(df['minutes'] / 90, 0.01)).values
+        
+        # Create base XGBoost model
+        base_model = XGBRegressor(
+            random_state=config.random_state,
+            verbosity=0,
+            n_jobs=1  # Prevent XGBoost from spawning threads
+        )
+        
+        # Run RandomizedSearchCV
+        search = RandomizedSearchCV(
+            estimator=base_model,
+            param_distributions=param_distributions,
+            n_iter=config.random_search_iter,
+            cv=3,  # 3-fold CV for speed
+            scoring='neg_root_mean_squared_error',
+            random_state=config.random_state,
+            n_jobs=1,  # Single job to avoid memory issues
+            verbose=1 if verbose else 0,
+            return_train_score=False  # Save memory
+        )
+        
+        search.fit(X, y)
+        
+        # Extract best params
+        best_params = search.best_params_.copy()
+        best_params['random_state'] = config.random_state
+        
+        if verbose:
+            print(f"    Best RMSE: {-search.best_score_:.4f}")
+            print(f"    Best params: {best_params}")
+        
+        # Clean up
+        del search
+        gc.collect()
+        
+        return best_params
+    
+    # =========================================================================
     # OPTUNA HYPERPARAMETER OPTIMIZATION
     # =========================================================================
     
     def _optuna_optimize(self, name: str, model_class, df: pd.DataFrame,
                          config: TuneConfig, verbose: bool) -> Tuple[Dict[str, Any], Any]:
-        """Run Optuna hyperparameter optimization."""
+        """Run Optuna hyperparameter optimization including feature count tuning."""
         if not OPTUNA_AVAILABLE:
             raise ImportError("Optuna is not installed. Run: pip install optuna")
         
@@ -1146,10 +1647,61 @@ class FPLPredictionPipeline:
         
         search_space = config.optuna_search_space().get(name, {})
         
+        # Check if we should tune feature count
+        tune_n_features = (
+            config.tune_feature_count and 
+            config.feature_selection != 'none' and
+            config.feature_selection_k_min < config.feature_selection_k_max
+        )
+        
+        # Get original features from model
+        temp_model = model_class()
+        original_features = temp_model.FEATURES.copy()
+        target_col = temp_model.TARGET
+        max_features = min(config.feature_selection_k_max, len(original_features))
+        min_features = max(config.feature_selection_k_min, 3)  # At least 3 features
+        del temp_model
+        
         # Split data for optimization
         train_df, val_df = train_test_split(
             df, test_size=config.test_size, random_state=config.random_state
         )
+        
+        # Pre-compute validation target
+        if name == 'minutes':
+            y_val = val_df['minutes'].values
+        elif name == 'bonus':
+            y_val = val_df['bonus'].values
+        else:
+            per90_col = f'{name}_per90'
+            if per90_col not in val_df.columns:
+                y_val = (val_df[name] / np.maximum(val_df['minutes'] / 90, 0.01)).values
+            else:
+                y_val = val_df[per90_col].values
+        
+        # Cache for feature selection results
+        feature_selection_cache = {}
+        
+        def get_selected_features(n_features: int) -> List[str]:
+            """Get selected features for a given n_features value (with caching)."""
+            if n_features in feature_selection_cache:
+                return feature_selection_cache[n_features]
+            
+            if config.feature_selection == 'rfe':
+                selected = self._select_features_rfe_silent(
+                    train_df, original_features, target_col, n_features
+                )
+            elif config.feature_selection == 'importance':
+                default_params = config.default_hyperparams().get(name, {})
+                default_params['random_state'] = config.random_state
+                selected = self._select_features_importance_silent(
+                    model_class, train_df, original_features, target_col, n_features, default_params
+                )
+            else:
+                selected = original_features[:n_features]
+            
+            feature_selection_cache[n_features] = selected
+            return selected
         
         def objective(trial):
             # Sample hyperparameters
@@ -1166,30 +1718,35 @@ class FPLPredictionPipeline:
                 elif param_type == 'categorical':
                     params[param_name] = trial.suggest_categorical(param_name, param_config[1])
             
+            # Sample number of features if tuning
+            if tune_n_features:
+                n_features = trial.suggest_int('n_features', min_features, max_features)
+                selected_features = get_selected_features(n_features)
+                
+                # Create a model with selected features
+                class TempModel(model_class):
+                    FEATURES = selected_features
+                
+                model = TempModel(**params)
+            else:
+                model = model_class(**params)
+            
             # Train model
-            model = model_class(**params)
             model.fit(train_df, verbose=False)
             
             # Evaluate
             if name == 'minutes':
-                y_val = val_df['minutes'].values
                 y_pred = model.predict(val_df)
             elif name == 'bonus':
-                y_val = val_df['bonus'].values
                 y_pred = model.predict(val_df)
             else:
-                target_col = f'{name}_per90'
-                if target_col not in val_df.columns:
-                    y_val = (val_df[name] / np.maximum(val_df['minutes'] / 90, 0.01)).values
-                else:
-                    y_val = val_df[target_col].values
                 y_pred = model.predict_per90(val_df)
             
-            return mean_absolute_error(y_val, y_pred)
+            return np.sqrt(mean_squared_error(y_val, y_pred))
         
         # Create and run study
         sampler = TPESampler(seed=config.random_state)
-        study = optuna.create_study(direction='minimize', sampler=sampler)
+        study = optuna.create_study(direction='minimize', sampler=sampler, storage =None)
         
         # Suppress Optuna logs unless verbose
         optuna.logging.set_verbosity(optuna.logging.WARNING if not verbose else optuna.logging.INFO)
@@ -1198,17 +1755,82 @@ class FPLPredictionPipeline:
             objective, 
             n_trials=config.optuna_trials, 
             timeout=config.optuna_timeout,
-            show_progress_bar=verbose
+            show_progress_bar=verbose,
+            gc_after_trial=True
         )
         
-        best_params = study.best_params
+        best_params = study.best_params.copy()
+        
+        # Extract n_features from best params if tuned
+        best_n_features = best_params.pop('n_features', None)
         best_params['random_state'] = config.random_state
         
         if verbose:
-            print(f"    Best MAE: {study.best_value:.4f}")
+            print(f"    Best RMSE: {study.best_value:.4f}")
             print(f"    Best params: {best_params}")
+            if best_n_features is not None:
+                print(f"    Best n_features: {best_n_features}")
+        
+        # Store best n_features in study for later use
+        study.best_n_features = best_n_features
+        
+        # Clean up to free memory
+        feature_selection_cache.clear()
+        gc.collect()
         
         return best_params, study
+    
+    def _create_model_with_features(self, model_class, features: List[str], params: Dict[str, Any]):
+        """Factory function to create a model with custom features.
+        
+        Using a factory avoids creating nested classes inside objective function,
+        which can cause memory leaks due to closure references.
+        """
+        class CustomFeatureModel(model_class):
+            FEATURES = features
+        
+        return CustomFeatureModel(**params)
+    
+    def _select_features_rfe_silent(self, df: pd.DataFrame, features: List[str], 
+                                     target_col: str, k: int) -> List[str]:
+        """Select top k features using RFE (silent version for Optuna)."""
+        from xgboost import XGBRegressor
+        
+        # Prepare data
+        available_features = [f for f in features if f in df.columns]
+        X = df[available_features].fillna(0)
+        
+        if target_col not in df.columns:
+            # Compute per90 target
+            base_col = target_col.replace('_per90', '')
+            y = (df[base_col] / np.maximum(df['minutes'] / 90, 0.01)).values
+        else:
+            y = df[target_col].values
+        
+        # Use a simple XGBoost model for RFE
+        base_model = XGBRegressor(n_estimators=50, max_depth=3, random_state=42, verbosity=0)
+        
+        # Run RFE
+        k = min(k, len(available_features))
+        selector = RFE(base_model, n_features_to_select=k, step=1)
+        selector.fit(X, y)
+        
+        selected_features = [f for f, selected in zip(available_features, selector.support_) if selected]
+        return selected_features
+    
+    def _select_features_importance_silent(self, model_class, df: pd.DataFrame, 
+                                            features: List[str], target_col: str,
+                                            k: int, params: Dict) -> List[str]:
+        """Select top k features by importance (silent version for Optuna)."""
+        # Train a model to get feature importances
+        temp_model = model_class(**params)
+        temp_model.fit(df, verbose=False)
+        
+        # Get feature importance
+        fi = temp_model.feature_importance()
+        top_features = fi.head(k)['feature'].tolist()
+        
+        return top_features
     
     # =========================================================================
     # BONUS MODEL TUNING
@@ -1260,11 +1882,12 @@ class FPLPredictionPipeline:
                 model_name='bonus', mae=0, rmse=0, r2=0, samples=len(bonus_df)
             )
         
-        # Optuna optimization if enabled
-        if config.optuna_trials > 0:
+        # Hyperparameter optimization
+        study = None
+        if config.random_search_iter > 0:
+            params = self._random_search_optimize('bonus', BonusModel, bonus_df, config, verbose)
+        elif config.optuna_trials > 0:
             params, study = self._optuna_optimize('bonus', BonusModel, bonus_df, config, verbose)
-        else:
-            study = None
         
         if config.cv_folds:
             return self._cv_evaluate_bonus_model(bonus_df, config, params, study, verbose)
@@ -1290,16 +1913,23 @@ class FPLPredictionPipeline:
             temp_model = BonusModel(n_simulations=100, **params)  # Few sims for feature selection
             original_features = temp_model.FEATURES.copy()
             
+            # Determine number of features to use:
+            # - If Optuna found best n_features, use that
+            # - Otherwise use config.feature_selection_k
+            n_features_to_select = config.feature_selection_k
+            if study is not None and hasattr(study, 'best_n_features') and study.best_n_features is not None:
+                n_features_to_select = study.best_n_features
+            
             if config.feature_selection == 'importance':
                 selected_features = self._select_features_importance(
                     BonusModel, train_df, original_features,
-                    temp_model.TARGET, config.feature_selection_k, params, verbose
+                    temp_model.TARGET, n_features_to_select, params, verbose
                 )
             elif config.feature_selection == 'rfe':
                 target_col = temp_model.TARGET
                 selected_features = self._select_features_rfe(
                     train_df, original_features, target_col, 
-                    config.feature_selection_k, verbose
+                    n_features_to_select, verbose
                 )
             
             if selected_features:
@@ -1362,20 +1992,27 @@ class FPLPredictionPipeline:
             temp_model = BonusModel(n_simulations=100, **params)  # Few sims for feature selection
             original_features = temp_model.FEATURES.copy()
             
+            # Determine number of features to use:
+            # - If Optuna found best n_features, use that
+            # - Otherwise use config.feature_selection_k
+            n_features_to_select = config.feature_selection_k
+            if study is not None and hasattr(study, 'best_n_features') and study.best_n_features is not None:
+                n_features_to_select = study.best_n_features
+            
             if config.feature_selection == 'importance':
                 selected_features = self._select_features_importance(
-                    BonusModel, df, original_features,  # FIX: Use BonusModel, not model_class
-                    temp_model.TARGET, config.feature_selection_k, params, verbose
+                    BonusModel, df, original_features,
+                    temp_model.TARGET, n_features_to_select, params, verbose
                 )
             elif config.feature_selection == 'rfe':
                 target_col = temp_model.TARGET
                 selected_features = self._select_features_rfe(
                     df, original_features, target_col, 
-                    config.feature_selection_k, verbose
+                    n_features_to_select, verbose
                 )
             
             if selected_features:
-                BonusModel.FEATURES = selected_features  # FIX: Use BonusModel, not model_class
+                BonusModel.FEATURES = selected_features
         
         if verbose:
             print(f"  Running {config.cv_folds}-fold cross-validation...")
@@ -1461,6 +2098,9 @@ class FPLPredictionPipeline:
         if verbose:
             print(f'  Train: {len(self.train_df)} records, Test: {len(self.test_df)} records')
         
+        # Step 3.5: Fetch FPL API availability status for test set
+        self._merge_fpl_availability_status(verbose)
+        
         # Step 4: Train and predict with all models
         self._train_minutes_model(verbose)
         self._train_goals_model(verbose)
@@ -1510,31 +2150,127 @@ class FPLPredictionPipeline:
         
         return self.test_df
     
+    def _merge_fpl_availability_status(self, verbose: bool):
+        """
+        Fetch FPL API availability status and merge into test_df.
+        
+        This adds columns:
+        - fpl_status: Status code ('a', 'i', 'u', 'd', 's')
+        - fpl_chance_of_playing: Chance of playing (0-100)
+        - fpl_status_available, fpl_status_injured, etc.: One-hot flags
+        - fpl_news: Injury/availability news text
+        """
+        if verbose:
+            print('[3.5] Fetching FPL API availability status...')
+        
+        try:
+            # Fetch current player status from FPL API
+            fpl_status_df = get_fpl_player_status(verbose=False)
+            
+            if len(fpl_status_df) == 0:
+                if verbose:
+                    print('  ⚠️ Could not fetch FPL API data, using default availability')
+                # Add default columns (all available)
+                self._add_default_fpl_status()
+                return
+            
+            # Merge status into test_df
+            self.test_df = merge_fpl_status(
+                self.test_df, 
+                fpl_status_df,
+                player_name_col='player_name',
+                team_col='team',
+                verbose=verbose
+            )
+            
+            # Print summary of unavailable players
+            if verbose:
+                unavailable = self.test_df[
+                    (self.test_df['fpl_status'].isin(['i', 'u', 's'])) | 
+                    (self.test_df['fpl_chance_of_playing'] < 75)
+                ].copy()
+                
+                if len(unavailable) > 0:
+                    print(f'  ⚠️ Players with availability concerns ({len(unavailable)}):')
+                    for _, row in unavailable.head(15).iterrows():
+                        status = row.get('fpl_status', '?')
+                        chance = row.get('fpl_chance_of_playing', 100)
+                        news = row.get('fpl_news', '')
+                        news_short = news[:50] + '...' if len(news) > 50 else news
+                        print(f'      {row["player_name"]:25s} ({status}, {chance:.0f}%) {news_short}')
+                    if len(unavailable) > 15:
+                        print(f'      ... and {len(unavailable) - 15} more')
+                else:
+                    print('  ✓ All players available')
+                    
+        except Exception as e:
+            if verbose:
+                print(f'  ⚠️ Error fetching FPL status: {e}')
+                print('  Using default availability (all available)')
+            self._add_default_fpl_status()
+    
+    def _add_default_fpl_status(self):
+        """Add default FPL status columns (all available)."""
+        self.test_df['fpl_status'] = 'a'
+        self.test_df['fpl_chance_of_playing'] = 100
+        self.test_df['fpl_status_available'] = 1
+        self.test_df['fpl_status_injured'] = 0
+        self.test_df['fpl_status_unavailable'] = 0
+        self.test_df['fpl_status_doubtful'] = 0
+        self.test_df['fpl_status_suspended'] = 0
+        self.test_df['fpl_news'] = ''
+    
     def _train_minutes_model(self, verbose: bool):
         if verbose:
             print('[4] Training minutes model...')
         
-        # Check if model already exists (from tuning)
+        # Check if model already exists (from tuning in same session)
         if 'minutes' in self.models and self.models['minutes'].is_fitted:
             if verbose:
                 print('  Using existing tuned minutes model')
         else:
-            self.models['minutes'] = MinutesModel()
+            # Try to load tuned params from JSON
+            best_params, selected_features = self.load_tuned_params('minutes')
+            if best_params:
+                if verbose:
+                    print(f'  Loading tuned params from JSON: {len(best_params)} params')
+                # Create model with selected features if available
+                if selected_features:
+                    class TunedMinutesModel(MinutesModel):
+                        FEATURES = selected_features
+                    self.models['minutes'] = TunedMinutesModel(**best_params)
+                else:
+                    self.models['minutes'] = MinutesModel(**best_params)
+            else:
+                self.models['minutes'] = MinutesModel()
             self.models['minutes'].fit(self.train_df, verbose=verbose)
         
-        self.test_df['pred_minutes'] = self.models['minutes'].predict(self.test_df)
-        self.train_df['pred_minutes'] = self.models['minutes'].predict(self.train_df)
+        # Predict minutes (FPL availability filter is applied inside predict())
+        self.test_df['pred_minutes'] = self.models['minutes'].predict(self.test_df, verbose=verbose)
+        self.train_df['pred_minutes'] = self.models['minutes'].predict(self.train_df, apply_fpl_filter=False)
     
     def _train_goals_model(self, verbose: bool):
         if verbose:
             print('[5] Training goals model...')
         
-        # Check if model already exists (from tuning)
+        # Check if model already exists (from tuning in same session)
         if 'goals' in self.models and self.models['goals'].is_fitted:
             if verbose:
                 print('  Using existing tuned goals model')
         else:
-            self.models['goals'] = GoalsModel()
+            # Try to load tuned params from JSON
+            best_params, selected_features = self.load_tuned_params('goals')
+            if best_params:
+                if verbose:
+                    print(f'  Loading tuned params from JSON: {len(best_params)} params')
+                if selected_features:
+                    class TunedGoalsModel(GoalsModel):
+                        FEATURES = selected_features
+                    self.models['goals'] = TunedGoalsModel(**best_params)
+                else:
+                    self.models['goals'] = GoalsModel(**best_params)
+            else:
+                self.models['goals'] = GoalsModel()
             self.models['goals'].fit(self.train_df, verbose=verbose)
         
         self.test_df['pred_goals_per90'] = self.models['goals'].predict_per90(self.test_df)
@@ -1544,12 +2280,24 @@ class FPLPredictionPipeline:
         if verbose:
             print('[6] Training assists model...')
         
-        # Check if model already exists (from tuning)
+        # Check if model already exists (from tuning in same session)
         if 'assists' in self.models and self.models['assists'].is_fitted:
             if verbose:
                 print('  Using existing tuned assists model')
         else:
-            self.models['assists'] = AssistsModel()
+            # Try to load tuned params from JSON
+            best_params, selected_features = self.load_tuned_params('assists')
+            if best_params:
+                if verbose:
+                    print(f'  Loading tuned params from JSON: {len(best_params)} params')
+                if selected_features:
+                    class TunedAssistsModel(AssistsModel):
+                        FEATURES = selected_features
+                    self.models['assists'] = TunedAssistsModel(**best_params)
+                else:
+                    self.models['assists'] = AssistsModel(**best_params)
+            else:
+                self.models['assists'] = AssistsModel()
             self.models['assists'].fit(self.train_df, verbose=verbose)
         
         self.test_df['pred_assists_per90'] = self.models['assists'].predict_per90(self.test_df)
@@ -1559,12 +2307,24 @@ class FPLPredictionPipeline:
         if verbose:
             print('[7] Training defcon model...')
         
-        # Check if model already exists (from tuning)
+        # Check if model already exists (from tuning in same session)
         if 'defcon' in self.models and self.models['defcon'].is_fitted:
             if verbose:
                 print('  Using existing tuned defcon model')
         else:
-            self.models['defcon'] = DefconModel()
+            # Try to load tuned params from JSON
+            best_params, selected_features = self.load_tuned_params('defcon')
+            if best_params:
+                if verbose:
+                    print(f'  Loading tuned params from JSON: {len(best_params)} params')
+                if selected_features:
+                    class TunedDefconModel(DefconModel):
+                        FEATURES = selected_features
+                    self.models['defcon'] = TunedDefconModel(**best_params)
+                else:
+                    self.models['defcon'] = DefconModel(**best_params)
+            else:
+                self.models['defcon'] = DefconModel()
             self.models['defcon'].fit(self.train_df, verbose=verbose)
         
         self.test_df['pred_defcon_per90'] = self.models['defcon'].predict_per90(self.test_df)
@@ -1574,12 +2334,38 @@ class FPLPredictionPipeline:
     def _train_clean_sheet_model(self, target_season: str, target_gw: int, verbose: bool):
         if verbose:
             print('[8] Training clean sheet model...')
-        self.models['clean_sheet'] = CleanSheetModel()
+        
+        # Check if model already exists (from tuning in same session)
+        if 'clean_sheet' in self.models and self.models['clean_sheet'].is_fitted:
+            if verbose:
+                print('  Using existing tuned clean_sheet model')
+            cs_model = self.models['clean_sheet']
+        else:
+            # Try to load tuned params from JSON
+            best_params, selected_features = self.load_tuned_params('clean_sheet')
+            if best_params:
+                if verbose:
+                    print(f'  Loading tuned params from JSON: {len(best_params)} params')
+                    if selected_features:
+                        print(f'  Loading {len(selected_features)} selected features')
+                # Create model with selected features if available
+                if selected_features:
+                    class TunedCSModel(CleanSheetModel):
+                        FEATURES = selected_features
+                    cs_model = TunedCSModel(**best_params)
+                else:
+                    cs_model = CleanSheetModel(**best_params)
+            else:
+                cs_model = CleanSheetModel()
+            self.models['clean_sheet'] = cs_model
+        
         team_features = self.models['clean_sheet'].prepare_features(self.df)
         team_train = team_features[~((team_features['season'] == target_season) & (team_features['gameweek'] == target_gw))]
         team_test = team_features[(team_features['season'] == target_season) & (team_features['gameweek'] == target_gw)]
         
-        self.models['clean_sheet'].fit(team_train, verbose=verbose)
+        # Only fit if not already fitted
+        if not self.models['clean_sheet'].is_fitted:
+            self.models['clean_sheet'].fit(team_train, verbose=verbose)
         
         # For upcoming gameweeks, team_test will be empty - need to build it from fixtures
         if len(team_test) == 0 and len(self.test_df) > 0:
@@ -1606,6 +2392,12 @@ class FPLPredictionPipeline:
                     'team_conceded_last1': g['goals_conceded'].iloc[-1] if len(g) > 0 else 1,
                     'team_conceded_roll3': g['goals_conceded'].tail(3).mean() if len(g) >= 1 else 1,
                     'team_conceded_roll5': g['goals_conceded'].tail(5).mean() if len(g) >= 1 else 1,
+                    'team_conceded_roll10': g['goals_conceded'].tail(10).mean() if len(g) >= 1 else 1,
+                    'team_conceded_roll30': g['goals_conceded'].tail(30).mean() if len(g) >= 1 else 1,
+                    'team_cs_roll5': (g['clean_sheet'].tail(5).sum() if 'clean_sheet' in g.columns and len(g) >= 1 else 0),
+                    'team_cs_roll10': (g['clean_sheet'].tail(10).sum() if 'clean_sheet' in g.columns and len(g) >= 1 else 0),
+                    'team_cs_roll30': (g['clean_sheet'].tail(30).sum() if 'clean_sheet' in g.columns and len(g) >= 1 else 0),
+                    'team_xga_roll5': g['xga'].tail(5).mean() if 'xga' in g.columns and len(g) >= 1 else 1.0,
                     'latest_gw': g['gameweek'].iloc[-1] if len(g) > 0 else 0,
                 })
             ).reset_index()
@@ -1629,6 +2421,9 @@ class FPLPredictionPipeline:
                     'team_goals_last1': g['goals'].iloc[-1] if len(g) > 0 else 0,
                     'team_goals_roll3': g['goals'].tail(3).mean() if len(g) >= 1 else 0,
                     'team_goals_roll5': g['goals'].tail(5).mean() if len(g) >= 1 else 0,
+                    'team_goals_roll10': g['goals'].tail(10).mean() if len(g) >= 1 else 0,
+                    'team_goals_roll30': g['goals'].tail(30).mean() if len(g) >= 1 else 0,
+                    'team_xg_roll5': g['xg'].tail(5).mean() if 'xg' in g.columns and len(g) >= 1 else 1.5,
                     'latest_gw': g['gameweek'].iloc[-1] if len(g) > 0 else 0,
                 })
             ).reset_index()
@@ -1656,6 +2451,9 @@ class FPLPredictionPipeline:
                         'team_goals_last1': g['goals'].iloc[-1] if len(g) > 0 else 0,
                         'team_goals_roll3': g['goals'].tail(3).mean() if len(g) >= 1 else 0,
                         'team_goals_roll5': g['goals'].tail(5).mean() if len(g) >= 1 else 0,
+                        'team_goals_roll10': g['goals'].tail(10).mean() if len(g) >= 1 else 0,
+                        'team_goals_roll30': g['goals'].tail(30).mean() if len(g) >= 1 else 0,
+                        'team_xg_roll5': g['xg'].tail(5).mean() if 'xg' in g.columns and len(g) >= 1 else 1.5,
                         'latest_gw': g['gameweek'].iloc[-1] if len(g) > 0 else 0,
                     })
                 ).reset_index()
@@ -1742,37 +2540,45 @@ class FPLPredictionPipeline:
                     if matched_team:
                         team_def = team_defensive[team_defensive['team'] == matched_team]
                 
+                # Helper to safely get value with NaN handling
+                def safe_get(series_or_dict, key, default):
+                    """Get value, returning default if NaN or missing."""
+                    val = series_or_dict.get(key, default) if hasattr(series_or_dict, 'get') else default
+                    if pd.isna(val):
+                        return default
+                    return val
+                
                 if len(team_def) > 0:
                     td = team_def.iloc[0]
-                    row['team_goals_conceded_last1'] = td.get('team_conceded_last1', 1.0)
-                    row['team_goals_conceded_roll3'] = td.get('team_conceded_roll3', 1.0)
-                    row['team_goals_conceded_roll5'] = td.get('team_conceded_roll5', 1.0)
+                    row['team_goals_conceded_last1'] = safe_get(td, 'team_conceded_last1', 1.0)
+                    row['team_goals_conceded_roll3'] = safe_get(td, 'team_conceded_roll3', 1.0)
+                    row['team_goals_conceded_roll5'] = safe_get(td, 'team_conceded_roll5', 1.0)
+                    row['team_goals_conceded_roll10'] = safe_get(td, 'team_conceded_roll10', 1.0)
+                    row['team_goals_conceded_roll30'] = safe_get(td, 'team_conceded_roll30', 1.0)
+                    row['team_xga_roll5'] = safe_get(td, 'team_xga_roll5', 1.0)
+                    row['team_clean_sheets_roll5'] = safe_get(td, 'team_cs_roll5', 0)
+                    row['team_clean_sheets_roll10'] = safe_get(td, 'team_cs_roll10', 0)
+                    row['team_clean_sheets_roll30'] = safe_get(td, 'team_cs_roll30', 0)
                 else:
                     row['team_goals_conceded_last1'] = 1.0
                     row['team_goals_conceded_roll3'] = 1.0
                     row['team_goals_conceded_roll5'] = 1.0
-                
-                # Other features from team_stats
-                if len(team_stats) > 0:
-                    ts = team_stats.iloc[0]
-                    row['team_goals_conceded_roll10'] = ts.get('team_goals_conceded_roll10', 1.0)
-                    row['team_goals_conceded_roll30'] = ts.get('team_goals_conceded_roll30', 1.0)
-                    row['team_xga_roll5'] = ts.get('team_xga_roll5', 1.0)
-                    row['team_clean_sheets_roll5'] = ts.get('team_clean_sheets_roll5', 0)
-                    row['team_clean_sheets_roll10'] = ts.get('team_clean_sheets_roll10', 0)
-                    row['team_clean_sheets_roll30'] = ts.get('team_clean_sheets_roll30', 0)
-                    row['team_xga_roll5_home'] = ts.get('team_xga_roll5_home', 1.0)
-                    row['team_xga_roll5_away'] = ts.get('team_xga_roll5_away', 1.0)
-                    row['team_encoded'] = ts.get('team_encoded', -1)
-                else:
                     row['team_goals_conceded_roll10'] = 1.0
                     row['team_goals_conceded_roll30'] = 1.0
                     row['team_xga_roll5'] = 1.0
                     row['team_clean_sheets_roll5'] = 0
                     row['team_clean_sheets_roll10'] = 0
                     row['team_clean_sheets_roll30'] = 0
-                    row['team_xga_roll5_home'] = 1.0
-                    row['team_xga_roll5_away'] = 1.0
+                
+                # Get team encoding and home/away xGA from team_stats (latest_team_stats)
+                if len(team_stats) > 0:
+                    ts = team_stats.iloc[0]
+                    row['team_xga_roll5_home'] = safe_get(ts, 'team_xga_roll5_home', row.get('team_xga_roll5', 1.0))
+                    row['team_xga_roll5_away'] = safe_get(ts, 'team_xga_roll5_away', row.get('team_xga_roll5', 1.0))
+                    row['team_encoded'] = safe_get(ts, 'team_encoded', -1)
+                else:
+                    row['team_xga_roll5_home'] = row.get('team_xga_roll5', 1.0)
+                    row['team_xga_roll5_away'] = row.get('team_xga_roll5', 1.0)
                     row['team_encoded'] = -1
                 
                 # Copy opponent attacking features - use team_attacking which has their actual goals scored
@@ -1816,19 +2622,21 @@ class FPLPredictionPipeline:
                 
                 if len(opp_atk) > 0:
                     oa = opp_atk.iloc[0]
-                    row['opp_goals_scored_last1'] = oa.get('team_goals_last1', 1.5)
-                    row['opp_goals_scored_roll3'] = oa.get('team_goals_roll3', 1.5)
-                    row['opp_goals_scored_roll5'] = oa.get('team_goals_roll5', 1.5)
-                    row['opp_goals_scored_roll10'] = oa.get('team_goals_roll5', 1.5)  # Fallback to roll5
-                    row['opp_goals_scored_roll30'] = oa.get('team_goals_roll5', 1.5)  # Fallback to roll5
+                    row['opp_goals_scored_last1'] = safe_get(oa, 'team_goals_last1', 1.5)
+                    row['opp_goals_scored_roll3'] = safe_get(oa, 'team_goals_roll3', 1.5)
+                    row['opp_goals_scored_roll5'] = safe_get(oa, 'team_goals_roll5', 1.5)
+                    row['opp_goals_scored_roll10'] = safe_get(oa, 'team_goals_roll10', safe_get(oa, 'team_goals_roll5', 1.5))
+                    row['opp_goals_scored_roll30'] = safe_get(oa, 'team_goals_roll30', safe_get(oa, 'team_goals_roll5', 1.5))
+                    row['opp_xg_roll5'] = safe_get(oa, 'team_xg_roll5', 1.5)  # Opponent's attacking xG
                 else:
                     row['opp_goals_scored_last1'] = 1.5
                     row['opp_goals_scored_roll3'] = 1.5
                     row['opp_goals_scored_roll5'] = 1.5
                     row['opp_goals_scored_roll10'] = 1.5
                     row['opp_goals_scored_roll30'] = 1.5
+                    row['opp_xg_roll5'] = 1.5
                 
-                # Other opponent features from opp_stats
+                # Get opponent's home/away xG and encoding from opp_stats (latest_team_stats)
                 # First try to match opp_stats with same alias logic
                 if len(opp_stats) == 0 and len(latest_team_stats) > 0:
                     matched_opp = match_team(opponent, latest_team_stats['team'].unique())
@@ -1837,19 +2645,24 @@ class FPLPredictionPipeline:
                 
                 if len(opp_stats) > 0:
                     os = opp_stats.iloc[0]
-                    row['opp_xg_roll5'] = os.get('team_xga_roll5', 1.5)  # Use opponent's xga as their attacking xG
-                    row['opp_xg_roll5_home'] = os.get('team_xga_roll5_home', 1.5)
-                    row['opp_xg_roll5_away'] = os.get('team_xga_roll5_away', 1.5)
-                    row['opponent_encoded'] = os.get('team_encoded', -1)
+                    # Use opponent's xGA (their defensive stat) as proxy for their attacking strength in different venues
+                    row['opp_xg_roll5_home'] = safe_get(os, 'team_xga_roll5_home', row.get('opp_xg_roll5', 1.5))
+                    row['opp_xg_roll5_away'] = safe_get(os, 'team_xga_roll5_away', row.get('opp_xg_roll5', 1.5))
+                    row['opponent_encoded'] = safe_get(os, 'team_encoded', -1)
                 else:
-                    row['opp_xg_roll5'] = 1.5
-                    row['opp_xg_roll5_home'] = 1.5
-                    row['opp_xg_roll5_away'] = 1.5
+                    row['opp_xg_roll5_home'] = row.get('opp_xg_roll5', 1.5)
+                    row['opp_xg_roll5_away'] = row.get('opp_xg_roll5', 1.5)
                     row['opponent_encoded'] = -1
                 
-                # Compute derived features
-                row['xga_xg_ratio'] = row.get('team_xga_roll5', 1.0) / (row.get('opp_xg_roll5', 1.5) + 0.1)
-                row['defensive_advantage'] = row.get('opp_xg_roll5', 1.5) - row.get('team_xga_roll5', 1.0)
+                # Compute derived features (use safe defaults for any NaN values)
+                team_xga = row.get('team_xga_roll5', 1.0)
+                opp_xg = row.get('opp_xg_roll5', 1.5)
+                if pd.isna(team_xga):
+                    team_xga = 1.0
+                if pd.isna(opp_xg):
+                    opp_xg = 1.5
+                row['xga_xg_ratio'] = team_xga / (opp_xg + 0.1)
+                row['defensive_advantage'] = opp_xg - team_xga
                 
                 team_test_rows.append(row)
             
@@ -1919,8 +2732,23 @@ class FPLPredictionPipeline:
             
             train_bonus_df = current_season_train[current_season_train['minutes'] >= 60].copy()
             
-            # Train the Monte Carlo bonus model (fits baseline BPS model)
-            self.models['bonus'] = BonusModel(n_simulations=1000)
+            # Try to load tuned params from JSON
+            best_params, selected_features = self.load_tuned_params('bonus')
+            if best_params:
+                if verbose:
+                    print(f'  Loading tuned params from JSON: {len(best_params)} params')
+                # BonusModel may have different params - filter to valid ones
+                bonus_valid_params = {k: v for k, v in best_params.items() if k != 'random_state'}
+                bonus_valid_params['n_simulations'] = 1000
+                if selected_features:
+                    class TunedBonusModel(BonusModel):
+                        FEATURES = selected_features
+                    self.models['bonus'] = TunedBonusModel(**bonus_valid_params)
+                else:
+                    self.models['bonus'] = BonusModel(**bonus_valid_params)
+            else:
+                # Train the Monte Carlo bonus model (fits baseline BPS model)
+                self.models['bonus'] = BonusModel(n_simulations=1000)
             self.models['bonus'].fit(train_bonus_df, verbose=verbose)
             
             # Predict using Monte Carlo simulation with our model predictions
@@ -2095,8 +2923,8 @@ class FPLPredictionPipeline:
         # Get features from PRIOR data only
         latest_features = prior_data.sort_values(['player_id', 'season', 'gameweek']).groupby('player_id').last().reset_index()
         
-        # Merge historical features
-        feature_cols = [c for c in latest_features.columns if 'roll' in c or 'last' in c or 'per90' in c or c in [
+        # Merge historical features (including lifetime player profile features)
+        feature_cols = [c for c in latest_features.columns if 'roll' in c or 'last' in c or 'per90' in c or 'lifetime' in c or c in [
             'is_defender', 'is_midfielder', 'is_forward', 'is_goalkeeper', 'starter_score', 'full_90_rate'
         ]]
         feature_cols = ['player_id'] + feature_cols
@@ -2106,7 +2934,7 @@ class FPLPredictionPipeline:
         
         # Fill missing with sensible defaults
         for col in test_df.columns:
-            if 'roll' in col or 'per90' in col:
+            if 'roll' in col or 'per90' in col or 'lifetime' in col:
                 test_df[col] = test_df[col].fillna(0)
         
         test_df['starter_score'] = test_df['starter_score'].fillna(0.5)

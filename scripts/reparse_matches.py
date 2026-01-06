@@ -197,10 +197,19 @@ def reparse_match(html_path):
     return True
 
 
-def reparse_all(force=False):
+def reparse_all(force=False, seasons=None):
     """Re-parse all saved HTML files."""
-    html_files = list(RAW_HTML_DIR.glob("**/*.html"))
-    print(f"Found {len(html_files)} HTML files total")
+    if seasons:
+        # Only parse specified seasons
+        html_files = []
+        for season in seasons:
+            season_dir = RAW_HTML_DIR / season
+            if season_dir.exists():
+                html_files.extend(list(season_dir.glob("*.html")))
+        print(f"Found {len(html_files)} HTML files for seasons: {seasons}")
+    else:
+        html_files = list(RAW_HTML_DIR.glob("**/*.html"))
+        print(f"Found {len(html_files)} HTML files total")
     
     # Load progress
     reparsed = load_reparse_progress()
@@ -210,7 +219,7 @@ def reparse_all(force=False):
         html_files = [f for f in html_files if str(f) not in reparsed]
         print(f"Remaining to re-parse: {len(html_files)} files\n")
     else:
-        print("Force mode: re-parsing ALL files\n")
+        print("Force mode: re-parsing ALL specified files\n")
     
     if not html_files:
         print("Nothing to re-parse!")
@@ -257,7 +266,8 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Re-parse FBRef HTML files")
     parser.add_argument("--force", action="store_true", help="Force re-parse all files, ignoring progress")
+    parser.add_argument("--seasons", nargs="+", help="Seasons to re-parse (e.g., 2017-18 2018-19)")
     args = parser.parse_args()
     
-    reparse_all(force=args.force)
+    reparse_all(force=args.force, seasons=args.seasons)
 

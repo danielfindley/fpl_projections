@@ -88,7 +88,7 @@ class CleanSheetModel:
         team_match = df.groupby(['team', 'opponent', 'season', 'gameweek', 'is_home']).agg(agg_dict).reset_index()
         
         # We need goals conceded - that's the opponent's goals scored
-        # Create opponent goals lookup
+        # Create opponent goals lookup - goals_conceded for team A = goals scored by opponent B in that match
         opponent_goals = team_match[['team', 'season', 'gameweek', 'goals']].copy()
         opponent_goals.columns = ['opponent', 'season', 'gameweek', 'goals_conceded']
         

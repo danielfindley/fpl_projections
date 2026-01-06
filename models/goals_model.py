@@ -42,6 +42,14 @@ class GoalsModel:
         'sca_per90_roll5',
         'gca_per90_roll5',
         
+        # LIFETIME PLAYER PROFILE (career-long stats)
+        'lifetime_goals_per90',      # Career goals per 90 mins
+        'lifetime_xg_per90',         # Career xG per 90 mins
+        'lifetime_shots_per90',      # Career shots per 90 mins
+        'lifetime_sca_per90',        # Career shot-creating actions per 90
+        'lifetime_gca_per90',        # Career goal-creating actions per 90
+        'lifetime_minutes',          # Total career minutes (experience indicator)
+        
         # Recent form
         'goals_last1',
         'goals_roll3',

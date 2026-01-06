@@ -39,6 +39,14 @@ class BonusModel:
         # 'pred_defcon_prob',
         # 'pred_minutes',
         
+        # LIFETIME PLAYER PROFILE (career-long stats for bonus prediction)
+        'lifetime_goals_per90',             # Career goals per 90 mins
+        'lifetime_assists_per90',           # Career assists per 90 mins
+        'lifetime_xg_per90',                # Career xG per 90 mins
+        'lifetime_xag_per90',               # Career xAG per 90 mins
+        'lifetime_goal_involvements_per90', # Career G+A per 90 mins
+        'lifetime_defcon_per90',            # Career defensive contribution per 90
+        'lifetime_minutes',                 # Total career minutes (experience indicator)
         
         # Rolling performance - scoring
         'player_roll5_xg',
