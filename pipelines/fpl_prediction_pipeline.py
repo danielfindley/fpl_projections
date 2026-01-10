@@ -2174,12 +2174,13 @@ class FPLPredictionPipeline:
                 self._add_default_fpl_status()
                 return
             
-            # Merge status into test_df
+            # Merge status into test_df (uses name_matches.json, same as bonus matching)
             self.test_df = merge_fpl_status(
                 self.test_df, 
                 fpl_status_df,
                 player_name_col='player_name',
                 team_col='team',
+                data_dir=self.data_dir,
                 verbose=verbose
             )
             

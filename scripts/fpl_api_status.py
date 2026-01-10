@@ -10,15 +10,15 @@ Usage:
     from scripts.fpl_api_status import get_fpl_player_status, merge_fpl_status
     
     status_df = get_fpl_player_status()
-    df_with_status = merge_fpl_status(predictions_df, status_df)
+    df_with_status = merge_fpl_status(predictions_df, status_df, data_dir='data')
 """
 
+import json
 import requests
 import pandas as pd
 import numpy as np
-from typing import Optional
+from typing import Optional, Union
 from pathlib import Path
-from difflib import SequenceMatcher
 
 
 # FPL API endpoint
@@ -104,82 +104,30 @@ def get_fpl_player_status(verbose: bool = True) -> pd.DataFrame:
     return df
 
 
-def normalize_name(name: str) -> str:
-    """Normalize player name for matching."""
-    if pd.isna(name):
-        return ''
-    name = str(name).lower().strip()
-    # Remove accents/special chars - simple approach
-    replacements = {
-        'á': 'a', 'à': 'a', 'ã': 'a', 'â': 'a', 'ä': 'a',
-        'é': 'e', 'è': 'e', 'ê': 'e', 'ë': 'e',
-        'í': 'i', 'ì': 'i', 'î': 'i', 'ï': 'i',
-        'ó': 'o', 'ò': 'o', 'õ': 'o', 'ô': 'o', 'ö': 'o', 'ø': 'o',
-        'ú': 'u', 'ù': 'u', 'û': 'u', 'ü': 'u',
-        'ñ': 'n', 'ç': 'c', 'ß': 'ss',
-    }
-    for old, new in replacements.items():
-        name = name.replace(old, new)
-    return name
-
-
-def normalize_team(team: str) -> str:
-    """Normalize team name for matching."""
-    if pd.isna(team):
-        return ''
-    team = str(team).lower().strip()
-    # Common normalizations
-    replacements = {
-        'manchester united': 'man utd',
-        'manchester city': 'man city',
-        'tottenham hotspur': 'spurs',
-        'tottenham': 'spurs',
-        'wolverhampton wanderers': 'wolves',
-        'wolverhampton': 'wolves',
-        'nottingham forest': "nott'm forest",
-        'nottingham': "nott'm forest",
-        'newcastle united': 'newcastle',
-        'west ham united': 'west ham',
-        'brighton & hove albion': 'brighton',
-        'brighton and hove albion': 'brighton',
-        'leicester city': 'leicester',
-        'aston_villa': 'aston villa',
-        'crystal_palace': 'crystal palace',
-        'west_ham': 'west ham',
-        'man_utd': 'man utd',
-        'man_city': 'man city',
-    }
-    team = team.replace('_', ' ')
-    for old, new in replacements.items():
-        if old in team:
-            team = new
-            break
-    return team
-
-
-def fuzzy_match_score(s1: str, s2: str) -> float:
-    """Get fuzzy match score between two strings."""
-    return SequenceMatcher(None, s1, s2).ratio()
-
-
-def merge_fpl_status(df: pd.DataFrame, fpl_status_df: pd.DataFrame = None,
+def merge_fpl_status(df: pd.DataFrame, 
+                      fpl_status_df: pd.DataFrame = None,
                       player_name_col: str = 'player_name',
                       team_col: str = 'team',
+                      data_dir: Union[str, Path] = 'data',
                       verbose: bool = True) -> pd.DataFrame:
     """
     Merge FPL status data into predictions dataframe.
+    
+    Uses name_matches.json (same as bonus matching) for consistent player matching.
     
     Args:
         df: DataFrame with player predictions
         fpl_status_df: FPL status DataFrame (if None, will fetch from API)
         player_name_col: Column name for player names in df
         team_col: Column name for team in df
+        data_dir: Path to data directory containing name_matching/name_matches.json
         verbose: Whether to print progress
     
     Returns:
         DataFrame with FPL status columns merged in
     """
     df = df.copy()
+    data_dir = Path(data_dir)
     
     # Fetch status if not provided
     if fpl_status_df is None or len(fpl_status_df) == 0:
@@ -199,14 +147,31 @@ def merge_fpl_status(df: pd.DataFrame, fpl_status_df: pd.DataFrame = None,
         df['fpl_news'] = ''
         return df
     
-    # Normalize names for matching
-    df['_norm_name'] = df[player_name_col].apply(normalize_name)
-    df['_norm_team'] = df[team_col].apply(normalize_team)
+    # Load name_matches.json (same matching as bonus data)
+    name_matches_path = data_dir / 'name_matching' / 'name_matches.json'
+    name_matches = {}
+    if name_matches_path.exists():
+        with open(name_matches_path, encoding='utf-8') as f:
+            name_matches = json.load(f)
+        if verbose:
+            print(f"  [*] Loaded {len(name_matches)} name matches from {name_matches_path}")
+    else:
+        if verbose:
+            print(f"  [WARN] name_matches.json not found at {name_matches_path}")
     
-    fpl_status_df['_norm_full'] = fpl_status_df['fpl_full_name'].apply(normalize_name)
-    fpl_status_df['_norm_web'] = fpl_status_df['fpl_web_name'].apply(normalize_name)
-    fpl_status_df['_norm_second'] = fpl_status_df['fpl_second_name'].apply(normalize_name)
-    fpl_status_df['_norm_team'] = fpl_status_df['fpl_team_name'].apply(normalize_team)
+    # Create FPL ID lookup from status data
+    fpl_id_to_status = {}
+    for _, row in fpl_status_df.iterrows():
+        fpl_id_to_status[row['fpl_id']] = {
+            'fpl_status': row['fpl_status'],
+            'fpl_chance_of_playing': row['fpl_chance_of_playing'],
+            'fpl_status_available': row['fpl_status_available'],
+            'fpl_status_injured': row['fpl_status_injured'],
+            'fpl_status_unavailable': row['fpl_status_unavailable'],
+            'fpl_status_doubtful': row['fpl_status_doubtful'],
+            'fpl_status_suspended': row['fpl_status_suspended'],
+            'fpl_news': row['fpl_news'],
+        }
     
     # Initialize status columns with defaults (available)
     df['fpl_status'] = 'a'
@@ -222,70 +187,30 @@ def merge_fpl_status(df: pd.DataFrame, fpl_status_df: pd.DataFrame = None,
     unmatched = []
     
     for idx, row in df.iterrows():
-        player_norm = row['_norm_name']
-        team_norm = row['_norm_team']
+        player_name = row[player_name_col]
         
-        # Try exact matches first
-        # 1. Full name + team
-        match = fpl_status_df[
-            (fpl_status_df['_norm_full'] == player_norm) & 
-            (fpl_status_df['_norm_team'] == team_norm)
-        ]
-        
-        # 2. Second name (surname) + team
-        if len(match) == 0:
-            # Extract last word of player name as surname
-            surname = player_norm.split()[-1] if player_norm else ''
-            match = fpl_status_df[
-                (fpl_status_df['_norm_second'] == surname) & 
-                (fpl_status_df['_norm_team'] == team_norm)
-            ]
-        
-        # 3. Web name + team
-        if len(match) == 0:
-            match = fpl_status_df[
-                (fpl_status_df['_norm_web'] == player_norm) & 
-                (fpl_status_df['_norm_team'] == team_norm)
-            ]
-        
-        # 4. Fuzzy match on same team
-        if len(match) == 0:
-            same_team = fpl_status_df[fpl_status_df['_norm_team'] == team_norm]
-            if len(same_team) > 0:
-                # Score against full name, web name, and second name
-                best_score = 0
-                best_idx = None
-                for fpl_idx, fpl_row in same_team.iterrows():
-                    scores = [
-                        fuzzy_match_score(player_norm, fpl_row['_norm_full']),
-                        fuzzy_match_score(player_norm, fpl_row['_norm_web']),
-                        fuzzy_match_score(player_norm.split()[-1], fpl_row['_norm_second']),
-                    ]
-                    max_score = max(scores)
-                    if max_score > best_score:
-                        best_score = max_score
-                        best_idx = fpl_idx
+        # Look up in name_matches.json (same as bonus matching)
+        if player_name in name_matches:
+            match_data = name_matches[player_name]
+            if isinstance(match_data, dict) and 'fpl_id' in match_data:
+                fpl_id = match_data['fpl_id']
                 
-                if best_score >= 0.7:  # Threshold for fuzzy match
-                    match = fpl_status_df.loc[[best_idx]]
+                # Look up status by FPL ID
+                if fpl_id in fpl_id_to_status:
+                    status = fpl_id_to_status[fpl_id]
+                    df.at[idx, 'fpl_status'] = status['fpl_status']
+                    df.at[idx, 'fpl_chance_of_playing'] = status['fpl_chance_of_playing']
+                    df.at[idx, 'fpl_status_available'] = status['fpl_status_available']
+                    df.at[idx, 'fpl_status_injured'] = status['fpl_status_injured']
+                    df.at[idx, 'fpl_status_unavailable'] = status['fpl_status_unavailable']
+                    df.at[idx, 'fpl_status_doubtful'] = status['fpl_status_doubtful']
+                    df.at[idx, 'fpl_status_suspended'] = status['fpl_status_suspended']
+                    df.at[idx, 'fpl_news'] = status['fpl_news']
+                    matched += 1
+                    continue
         
-        # Apply match
-        if len(match) > 0:
-            fpl_row = match.iloc[0]
-            df.at[idx, 'fpl_status'] = fpl_row['fpl_status']
-            df.at[idx, 'fpl_chance_of_playing'] = fpl_row['fpl_chance_of_playing']
-            df.at[idx, 'fpl_status_available'] = fpl_row['fpl_status_available']
-            df.at[idx, 'fpl_status_injured'] = fpl_row['fpl_status_injured']
-            df.at[idx, 'fpl_status_unavailable'] = fpl_row['fpl_status_unavailable']
-            df.at[idx, 'fpl_status_doubtful'] = fpl_row['fpl_status_doubtful']
-            df.at[idx, 'fpl_status_suspended'] = fpl_row['fpl_status_suspended']
-            df.at[idx, 'fpl_news'] = fpl_row['fpl_news']
-            matched += 1
-        else:
-            unmatched.append(f"{row[player_name_col]} ({row[team_col]})")
-    
-    # Clean up temp columns
-    df = df.drop(columns=['_norm_name', '_norm_team'], errors='ignore')
+        # Not found in name_matches.json
+        unmatched.append(f"{player_name} ({row[team_col]})")
     
     if verbose:
         print(f"  [OK] Matched {matched}/{len(df)} players with FPL status")
