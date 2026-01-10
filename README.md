@@ -145,14 +145,19 @@ A comprehensive machine learning pipeline for Fantasy Premier League player poin
 
 ### 5. Defcon Model (`DefconModel`)
 
-**Purpose:** Predicts defensive contribution for the "3+ Bonus Point" threshold.
+**Purpose:** Predicts defensive contribution for the "+2 FPL Points" threshold.
 
-**Architecture:** XGBoost Regressor
+**Architecture:** XGBoost Regressor + Poisson Probability
 
 **What is Defcon?**
 - **Defenders:** CBIT = Clearances + Blocks + Interceptions + Tackles (threshold: 10+)
 - **Midfielders:** CBIRT = CBIT + Recoveries (threshold: 12+)
-- Hitting threshold awards +1 FPL point
+- Hitting threshold awards **+2 FPL points**
+
+**How It Works:**
+1. XGBoost predicts expected defcon (λ) based on player history and opponent
+2. Since defcon is a count variable (sum of discrete defensive actions), we model it as **Poisson(λ)**
+3. Probability of threshold = **P(X ≥ threshold) = 1 - Poisson.CDF(threshold - 1, λ)**
 
 **Key Features:**
 - Rolling defcon per 90 (roll5, roll10)
@@ -161,7 +166,7 @@ A comprehensive machine learning pipeline for Fantasy Premier League player poin
 - Historical threshold hit rate
 - Opponent attacking strength (more attacks = more defensive actions)
 
-**Output:** Defcon per 90 rate → scaled by predicted minutes → probability of hitting threshold
+**Output:** Poisson probability of hitting threshold (0.0-1.0)
 
 ---
 
@@ -208,17 +213,17 @@ expected_points = (
     pred_goals × goal_points[position] +
     pred_assists × 3 +
     pred_cs_prob × cs_points[position] +
-    pred_defcon_prob × 1 +
+    pred_defcon_prob × 2 +
     pred_bonus
 )
 ```
 
-| Position | Goal Pts | CS Pts | Appearance (60+) |
-|----------|----------|--------|------------------|
-| GK       | 6        | 4      | 2                |
-| DEF      | 6        | 4      | 2                |
-| MID      | 5        | 1      | 2                |
-| FWD      | 4        | 0      | 2                |
+| Position | Goal Pts | CS Pts | Defcon Pts | Appearance (60+) |
+|----------|----------|--------|------------|------------------|
+| GK       | 6        | 4      | 2          | 2                |
+| DEF      | 6        | 4      | 2          | 2                |
+| MID      | 5        | 1      | 2          | 2                |
+| FWD      | 4        | 0      | 2          | 2                |
 
 ---
 

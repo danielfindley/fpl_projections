@@ -6,11 +6,15 @@ Predicts defensive contribution per 90 minutes (CBIT/CBIRT).
 - Mids/Forwards: CBIRT = CBIT + Recov (threshold 12+)
 
 Final expected defcon = (defcon_per90) * (pred_minutes / 90)
+
+Uses Poisson distribution to calculate probability of exceeding threshold,
+since defcon is a count variable (sum of discrete defensive actions).
 """
 
 import pandas as pd
 import numpy as np
 import xgboost as xgb
+from scipy.stats import poisson
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, r2_score
 from pathlib import Path
@@ -269,32 +273,34 @@ class DefconModel:
         return per90 * (pred_minutes / 90)
     
     def predict_proba_above_threshold(self, df: pd.DataFrame, pred_minutes: np.ndarray = None) -> np.ndarray:
-        """Predict probability of exceeding defcon threshold."""
+        """
+        Predict probability of exceeding defcon threshold using Poisson distribution.
+        
+        Since defcon is a count variable (tackles + interceptions + clearances + blocks + recoveries),
+        we model it as Poisson(λ) where λ = expected_defcon.
+        
+        P(defcon >= threshold) = 1 - P(defcon < threshold) = 1 - CDF(threshold - 1)
+        """
         if not self.is_fitted:
             raise ValueError("Model not fitted. Call fit() first.")
         
         if 'defcon_per90_roll5' not in df.columns:
             df = self.prepare_features(df)
         
-        # Predicted expected defcon
+        # Predicted expected defcon (lambda for Poisson)
         expected_defcon = self.predict_expected(df, pred_minutes)
         
-        # Threshold based on position
+        # Ensure lambda is positive (Poisson requires λ > 0)
+        expected_defcon = np.maximum(expected_defcon, 0.01)
+        
+        # Threshold based on position (DEF: 10, MID/FWD: 12)
         thresholds = np.where(df['is_defender'] == 1, 10, 12)
         
-        # Distance from threshold
-        distance = expected_defcon - thresholds
+        # P(X >= threshold) = 1 - P(X <= threshold - 1) = 1 - CDF(threshold - 1)
+        # Using scipy.stats.poisson: poisson.cdf(k, mu) = P(X <= k)
+        poisson_prob = 1 - poisson.cdf(thresholds - 1, expected_defcon)
         
-        # Historical hit rate (strong prior)
-        hist_rate = df['hit_threshold_roll5'].fillna(0).values
-        
-        # Sigmoid of distance
-        sigmoid_prob = 1 / (1 + np.exp(-distance / 1.5))
-        
-        # Combine: 40% history, 60% prediction
-        combined_prob = 0.4 * hist_rate + 0.6 * sigmoid_prob
-        
-        return np.clip(combined_prob, 0, 1)
+        return np.clip(poisson_prob, 0, 1)
     
     def feature_importance(self) -> pd.DataFrame:
         if not self.is_fitted:
