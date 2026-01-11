@@ -90,12 +90,6 @@ class GoalsModel:
         
         # Match context
         'is_home',
-        
-        # Position indicators
-        'is_forward',
-        'is_midfielder',
-        'is_defender',
-        'is_goalkeeper',
     ]
     
     TARGET = 'goals_per90'
@@ -112,18 +106,6 @@ class GoalsModel:
         self.model = xgb.XGBRegressor(**default_params)
         self.scaler = StandardScaler()
         self.is_fitted = False
-    
-    def _add_position_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add position indicator features."""
-        df = df.copy()
-        pos = df['position'].fillna('').str.upper()
-        
-        df['is_forward'] = pos.str.contains('FW|CF|ST|LW|RW').astype(int)
-        df['is_midfielder'] = pos.str.contains('CM|DM|AM|LM|RM|MF').astype(int)
-        df['is_defender'] = pos.str.contains('CB|LB|RB|WB|DF').astype(int)
-        df['is_goalkeeper'] = pos.str.contains('GK').astype(int)
-        
-        return df
     
     def prepare_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Prepare per-90 features."""
@@ -160,9 +142,6 @@ class GoalsModel:
         df['xg_roll3'] = df.groupby('player_id')['xg'].transform(
             lambda x: x.shift(1).rolling(3, min_periods=1).sum()
         ).fillna(0) if 'xg' in df.columns else 0
-        
-        # Position features
-        df = self._add_position_features(df)
         
         # Ensure is_home is numeric
         if 'is_home' in df.columns:
