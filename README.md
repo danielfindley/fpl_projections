@@ -2,6 +2,20 @@
 
 A comprehensive machine learning pipeline for Fantasy Premier League player points projection, featuring 6 specialized XGBoost models with Monte Carlo simulation for bonus points.
 
+## 📊 Latest Predictions
+
+**[View the latest gameweek predictions →](notebooks/latest_predictions.ipynb)**
+
+The predictions notebook automatically loads the most recent forecast from `data/predictions/` and displays:
+- 🏆 Top 15 overall picks
+- 🧤 Top goalkeepers
+- 🛡️ Top defenders  
+- 🎯 Top midfielders
+- ⚡ Top forwards
+- 💎 Differential picks
+
+---
+
 ## Architecture
 
 ```
